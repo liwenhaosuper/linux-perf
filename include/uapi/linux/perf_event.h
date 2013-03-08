@@ -138,8 +138,9 @@ enum perf_event_sample_format {
 	PERF_SAMPLE_IDENTIFIER			= 1U << 16,
 	PERF_SAMPLE_TRANSACTION			= 1U << 17,
 	PERF_SAMPLE_REGS_INTR			= 1U << 18,
+	PERF_SAMPLE_AUX				= 1U << 19,
 
-	PERF_SAMPLE_MAX = 1U << 19,		/* non-ABI */
+	PERF_SAMPLE_MAX = 1U << 20,		/* non-ABI */
 };
 
 /*
@@ -241,6 +242,9 @@ enum perf_event_read_format {
 					/* add: sample_stack_user */
 #define PERF_ATTR_SIZE_VER4	104	/* add: sample_regs_intr */
 					/* add: aux_watermark */
+#define PERF_ATTR_SIZE_VER5	128	/* add: aux_sample_config */
+					/* add: aux_sample_size */
+					/* add: aux_sample_type */
 
 /*
  * Hardware event_id to monitor via a performance monitoring event:
@@ -349,6 +353,16 @@ struct perf_event_attr {
 	 * See asm/perf_regs.h for details.
 	 */
 	__u64	sample_regs_intr;
+
+	/*
+	 * Itrace pmus' event config
+	 */
+	__u64	aux_sample_config;	/* event config for AUX sampling */
+	__u64	aux_sample_size;	/* desired sample size */
+	__u32	aux_sample_type;	/* pmu->type of an AUX PMU */
+
+	/* Align to u64. */
+	__u32	__reserved_2;
 };
 
 #define perf_flags(attr)	(*(&(attr)->read_format + 1))
@@ -724,6 +738,8 @@ enum perf_event_type {
 	 *	{ u64			transaction; } && PERF_SAMPLE_TRANSACTION
 	 *	{ u64			abi; # enum perf_sample_regs_abi
 	 *	  u64			regs[weight(mask)]; } && PERF_SAMPLE_REGS_INTR
+	 *	{ u64			size;
+	 *	  char			data[size]; } && PERF_SAMPLE_AUX
 	 * };
 	 */
 	PERF_RECORD_SAMPLE			= 9,

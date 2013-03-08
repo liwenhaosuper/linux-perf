@@ -1659,6 +1659,9 @@ void perf_event_disable(struct perf_event *event)
 	struct perf_event_context *ctx = event->ctx;
 	struct task_struct *task = ctx->task;
 
+	if (event->sampler)
+		perf_event_disable(event->sampler);
+
 	if (!task) {
 		/*
 		 * Disable the event on the cpu that it's on
@@ -2166,6 +2169,8 @@ void perf_event_enable(struct perf_event *event)
 	struct perf_event_context *ctx = event->ctx;
 	struct task_struct *task = ctx->task;
 
+	if (event->sampler)
+		perf_event_enable(event->sampler);
 	if (!task) {
 		/*
 		 * Enable the event on the cpu that it's on
@@ -3314,6 +3319,8 @@ static void unaccount_event_cpu(struct perf_event *event, int cpu)
 		atomic_dec(&per_cpu(perf_cgroup_events, cpu));
 }
 
+static void perf_aux_sampler_fini(struct perf_event *event);
+
 static void unaccount_event(struct perf_event *event)
 {
 	if (event->parent)
@@ -3333,6 +3340,8 @@ static void unaccount_event(struct perf_event *event)
 		static_key_slow_dec_deferred(&perf_sched_events);
 	if (has_branch_stack(event))
 		static_key_slow_dec_deferred(&perf_sched_events);
+	if ((event->attr.sample_type & PERF_SAMPLE_AUX))
+		perf_aux_sampler_fini(event);
 
 	unaccount_event_cpu(event, event->cpu);
 }
@@ -4670,6 +4679,143 @@ perf_output_sample_ustack(struct perf_output_handle *handle, u64 dump_size,
 	}
 }
 
+static void perf_aux_sampler_destroy(struct perf_event *event)
+{
+	struct ring_buffer *rb = event->rb;
+
+	if (event->sampler_destroy)
+		event->sampler_destroy(event);
+
+	if (!rb)
+		return;
+
+	ring_buffer_put(rb); /* can be last */
+}
+
+static int perf_aux_sampler_init(struct perf_event *event,
+				 struct task_struct *task,
+				 struct pmu *pmu)
+{
+	struct perf_event_attr attr;
+	struct perf_event *sampler;
+	struct ring_buffer *rb;
+	unsigned long nr_pages;
+
+	if (!pmu || !(pmu->setup_aux))
+		return -ENOTSUPP;
+
+	memset(&attr, 0, sizeof(attr));
+	attr.type = pmu->type;
+	attr.config = event->attr.aux_sample_config;
+	attr.sample_type = 0;
+	attr.disabled = event->attr.disabled;
+	attr.enable_on_exec = event->attr.enable_on_exec;
+	attr.exclude_hv = event->attr.exclude_hv;
+	attr.exclude_idle = event->attr.exclude_idle;
+	attr.exclude_user = event->attr.exclude_user;
+	attr.exclude_kernel = event->attr.exclude_kernel;
+	attr.aux_sample_size = event->attr.aux_sample_size;
+
+	sampler = perf_event_create_kernel_counter(&attr, event->cpu, task,
+						   NULL, NULL);
+	if (IS_ERR(sampler))
+		return PTR_ERR(sampler);
+
+	nr_pages = 1ul << __get_order(event->attr.aux_sample_size);
+
+	rb = rb_alloc_kernel(sampler, 0, nr_pages);
+	if (!rb) {
+		perf_event_release_kernel(sampler);
+		return -ENOMEM;
+	}
+
+	event->sampler = sampler;
+	sampler->sampler_destroy = sampler->destroy;
+	sampler->destroy = perf_aux_sampler_destroy;
+
+	return 0;
+}
+
+static void perf_aux_sampler_fini(struct perf_event *event)
+{
+	struct perf_event *sampler = event->sampler;
+
+	/* might get free'd from event->destroy() path */
+	if (!sampler)
+		return;
+
+	perf_event_release_kernel(sampler);
+
+	event->sampler = NULL;
+}
+
+static unsigned long perf_aux_sampler_trace(struct perf_event *event,
+					    struct perf_sample_data *data)
+{
+	struct perf_event *sampler = event->sampler;
+	struct ring_buffer *rb;
+
+	if (!sampler || sampler->state != PERF_EVENT_STATE_ACTIVE) {
+		data->aux.size = 0;
+		goto out;
+	}
+
+	rb = ring_buffer_get(sampler);
+	if (!rb) {
+		data->aux.size = 0;
+		goto out;
+	}
+
+	sampler->pmu->del(sampler, 0);
+
+	data->aux.to = local_read(&rb->aux_head);
+
+	if (data->aux.to < sampler->attr.aux_sample_size)
+		data->aux.from = rb->aux_nr_pages * PAGE_SIZE +
+			data->aux.to - sampler->attr.aux_sample_size;
+	else
+		data->aux.from = data->aux.to -
+			sampler->attr.aux_sample_size;
+	data->aux.size = ALIGN(sampler->attr.aux_sample_size, sizeof(u64));
+	ring_buffer_put(rb);
+
+out:
+	return data->aux.size;
+}
+
+static void perf_aux_sampler_output(struct perf_event *event,
+				    struct perf_output_handle *handle,
+				    struct perf_sample_data *data)
+{
+	struct perf_event *sampler = event->sampler;
+	struct ring_buffer *rb;
+	unsigned long pad;
+	int ret;
+
+	if (WARN_ON_ONCE(!sampler || !data->aux.size))
+		return;
+
+	rb = ring_buffer_get(sampler);
+	if (WARN_ON_ONCE(!rb))
+		return;
+	ret = rb_output_aux(rb, data->aux.from, data->aux.to,
+			    (aux_copyfn)perf_output_copy, handle);
+	if (ret < 0) {
+		pr_warn_ratelimited("failed to copy trace data\n");
+		goto out;
+	}
+
+	pad = data->aux.size - ret;
+	if (pad) {
+		u64 p = 0;
+
+		perf_output_copy(handle, &p, pad);
+	}
+out:
+	ring_buffer_put(rb);
+	sampler->pmu->add(sampler, PERF_EF_START);
+}
+
 static void __perf_event_header__init_id(struct perf_event_header *header,
 					 struct perf_sample_data *data,
 					 struct perf_event *event)
@@ -4973,6 +5119,13 @@ void perf_output_sample(struct perf_output_handle *handle,
 		}
 	}
 
+	if (sample_type & PERF_SAMPLE_AUX) {
+		perf_output_put(handle, data->aux.size);
+
+		if (data->aux.size)
+			perf_aux_sampler_output(event, handle, data);
+	}
+
 	if (!event->attr.watermark) {
 		int wakeup_events = event->attr.wakeup_events;
 
@@ -5089,6 +5242,14 @@ void perf_prepare_sample(struct perf_event_header *header,
 
 			size += hweight64(mask) * sizeof(u64);
 		}
+
+		header->size += size;
+	}
+
+	if (sample_type & PERF_SAMPLE_AUX) {
+		u64 size = sizeof(u64);
+
+		size += perf_aux_sampler_trace(event, data);
 
 		header->size += size;
 	}
@@ -7230,6 +7391,21 @@ perf_event_alloc(struct perf_event_attr *attr, int cpu,
 			err = get_callchain_buffers();
 			if (err)
 				goto err_pmu;
+		}
+
+		if (event->attr.sample_type & PERF_SAMPLE_AUX) {
+			struct pmu *aux_pmu;
+			int idx;
+
+			idx = srcu_read_lock(&pmus_srcu);
+			aux_pmu = __perf_find_pmu(event->attr.aux_sample_type);
+			err = perf_aux_sampler_init(event, task, aux_pmu);
+			srcu_read_unlock(&pmus_srcu, idx);
+
+			if (err) {
+				put_callchain_buffers();
+				goto err_pmu;
+			}
 		}
 	}
 

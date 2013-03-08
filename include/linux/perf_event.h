@@ -84,6 +84,12 @@ struct perf_regs {
 	struct pt_regs	*regs;
 };
 
+struct perf_aux_record {
+	u64		size;
+	unsigned long	from;
+	unsigned long	to;
+};
+
 struct task_struct;
 
 /*
@@ -458,6 +464,8 @@ struct perf_event {
 	perf_overflow_handler_t		overflow_handler;
 	void				*overflow_handler_context;
 
+	struct perf_event		*sampler;
+	void (*sampler_destroy)(struct perf_event *);
 #ifdef CONFIG_EVENT_TRACING
 	struct ftrace_event_call	*tp_event;
 	struct event_filter		*filter;
@@ -615,6 +623,7 @@ struct perf_sample_data {
 	 */
 	u64				addr;
 	struct perf_raw_record		*raw;
+	struct perf_aux_record		aux;
 	struct perf_branch_stack	*br_stack;
 	u64				period;
 	u64				weight;
@@ -657,6 +666,7 @@ static inline void perf_sample_data_init(struct perf_sample_data *data,
 	/* remaining struct members initialized in perf_prepare_sample() */
 	data->addr = addr;
 	data->raw  = NULL;
+	data->aux.from = data->aux.to = data->aux.size = 0;
 	data->br_stack = NULL;
 	data->period = period;
 	data->weight = 0;

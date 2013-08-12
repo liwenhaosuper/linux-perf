@@ -477,6 +477,10 @@ void perf_event__attr_swap(struct perf_event_attr *attr)
 	attr->branch_sample_type = bswap_64(attr->branch_sample_type);
 	attr->sample_regs_user	 = bswap_64(attr->sample_regs_user);
 	attr->sample_stack_user  = bswap_32(attr->sample_stack_user);
+	attr->aux_watermark	 = bswap_32(attr->aux_watermark);
+	attr->aux_sample_config	 = bswap_64(attr->aux_sample_config);
+	attr->aux_sample_type	 = bswap_32(attr->aux_sample_type);
+	attr->aux_sample_size	 = bswap_64(attr->aux_sample_size);
 
 	swap_bitfield((u8 *) (&attr->read_format + 1), sizeof(u64));
 }

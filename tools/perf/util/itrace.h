@@ -36,6 +36,7 @@ struct itrace_info_event;
 
 enum itrace_type {
 	PERF_ITRACE_UNKNOWN,
+	PERF_ITRACE_INTEL_PT,
 };
 
 enum itrace_error_type {

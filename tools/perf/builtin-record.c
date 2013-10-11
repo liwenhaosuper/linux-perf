@@ -613,8 +613,16 @@ out_child:
 	if (!err && !file->is_pipe) {
 		rec->session->header.data_size += rec->bytes_written;
 
-		if (!rec->no_buildid)
+		if (!rec->no_buildid) {
 			process_buildids(rec);
+			/*
+			 * We take all buildids when the file contains
+			 * Instruction Tracing data because we do not decode the
+			 * trace because it would take too long.
+			 */
+			if (rec->opts.full_itrace)
+				dsos__hit_all(rec->session);
+		}
 		perf_session__write_header(rec->session, rec->evlist,
 					   file->fd, true);
 	}

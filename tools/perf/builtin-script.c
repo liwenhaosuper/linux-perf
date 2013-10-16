@@ -16,6 +16,7 @@
 #include "util/evsel.h"
 #include "util/sort.h"
 #include "util/data.h"
+#include "util/itrace.h"
 #include <linux/bitmap.h>
 
 static char const		*script_name;
@@ -1505,6 +1506,7 @@ int cmd_script(int argc, const char **argv, const char *prefix __maybe_unused)
 	char *rec_script_path = NULL;
 	char *rep_script_path = NULL;
 	struct perf_session *session;
+	struct itrace_synth_opts itrace_synth_opts = {0};
 	char *script_path = NULL;
 	const char **__argv;
 	int i, j, err = 0;
@@ -1519,6 +1521,10 @@ int cmd_script(int argc, const char **argv, const char *prefix __maybe_unused)
 			.attr		 = process_attr,
 			.tracing_data	 = perf_event__process_tracing_data,
 			.build_id	 = perf_event__process_build_id,
+			.id_index	 = perf_event__process_id_index,
+			.itrace_info	 = perf_event__process_itrace_info,
+			.itrace		 = perf_event__process_itrace,
+			.itrace_error	 = perf_event__process_itrace_error,
 			.ordered_events	 = true,
 			.ordering_requires_timestamps = true,
 		},
@@ -1570,6 +1576,9 @@ int cmd_script(int argc, const char **argv, const char *prefix __maybe_unused)
 		    "Show the fork/comm/exit events"),
 	OPT_BOOLEAN('\0', "show-mmap-events", &script.show_mmap_events,
 		    "Show the mmap events"),
+	OPT_CALLBACK_OPTARG('Z', "itrace", &itrace_synth_opts, NULL, "opts",
+			    "Instruction Tracing options",
+			    itrace_parse_synth_opts),
 	OPT_END()
 	};
 	const char * const script_usage[] = {
@@ -1766,6 +1775,8 @@ int cmd_script(int argc, const char **argv, const char *prefix __maybe_unused)
 		goto out_delete;
 
 	script.session = session;
+
+	session->itrace_synth_opts = &itrace_synth_opts;
 
 	if (cpu_list) {
 		err = perf_session__cpu_bitmap(session, cpu_list, cpu_bitmap);

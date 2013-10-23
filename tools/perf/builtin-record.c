@@ -481,6 +481,14 @@ static int __cmd_record(struct record *rec, int argc, const char **argv)
 			goto out_delete_session;
 	}
 
+	if (rec->opts.sample_itrace) {
+		err = perf_event__synthesize_id_index(tool,
+						      process_synthesized_event,
+						      session->evlist, machine);
+		if (err)
+			goto out_delete_session;
+	}
+
 	err = perf_event__synthesize_kernel_mmap(tool, process_synthesized_event,
 						 machine);
 	if (err < 0)
@@ -939,6 +947,8 @@ struct option __record_options[] = {
 		    "use per-thread mmaps"),
 	OPT_BOOLEAN('I', "intr-regs", &record.opts.sample_intr_regs,
 		    "Sample machine registers on interrupt"),
+	OPT_CALLBACK_OPTARG('A', "aux", &record.opts, &record.itr, "opts",
+			    "sample AUX area", itrace_parse_sample_options),
 	OPT_END()
 };
 

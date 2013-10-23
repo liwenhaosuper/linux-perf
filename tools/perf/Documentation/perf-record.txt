@@ -222,6 +222,11 @@ Capture machine state (registers) at interrupt, i.e., on counter overflows for
 each sample. List of captured registers depends on the architecture. This option
 is off by default.
 
+-A::
+--aux::
+Enable AUX area sampling. An optional parameter string takes the form 'szname/options/'
+where sz in the sample size, and name and options depend on the data being sampled.
+
 SEE ALSO
 --------
 linkperf:perf-stat[1], linkperf:perf-list[1]

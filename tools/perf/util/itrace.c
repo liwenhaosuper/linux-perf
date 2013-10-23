@@ -330,6 +330,33 @@ out_err:
 	return err;
 }
 
+static int itrace_queues__add_indexed_event(struct itrace_queues *queues,
+					    struct perf_session *session,
+					    off_t file_offset, size_t sz)
+{
+	union perf_event *event;
+	int err;
+	char buf[PERF_SAMPLE_MAX_SIZE];
+
+	err = perf_session__peek_event(session, file_offset, buf,
+				       PERF_SAMPLE_MAX_SIZE, &event, NULL);
+	if (err)
+		return err;
+
+	if (event->header.type == PERF_RECORD_ITRACE) {
+		if (event->header.size != sizeof(struct itrace_event) ||
+		    event->header.size != sz) {
+			err = -EINVAL;
+			goto out;
+		}
+		file_offset += event->header.size;
+		err = itrace_queues__add_event(queues, session, event,
+					       file_offset, NULL);
+	}
+out:
+	return err;
+}
+
 void itrace_queues__free(struct itrace_queues *queues)
 {
 	unsigned int i;
@@ -484,6 +511,193 @@ itrace_record__init(struct perf_evlist *evlist __maybe_unused, int *err)
 {
 	*err = 0;
 	return NULL;
+}
+
+static int itrace_index__alloc(struct list_head *head)
+{
+	struct itrace_index *itrace_index;
+
+	itrace_index = malloc(sizeof(struct itrace_index));
+	if (!itrace_index)
+		return -ENOMEM;
+
+	itrace_index->nr = 0;
+	INIT_LIST_HEAD(&itrace_index->list);
+
+	list_add_tail(&itrace_index->list, head);
+
+	return 0;
+}
+
+void itrace_index__free(struct list_head *head)
+{
+	struct itrace_index *itrace_index, *n;
+
+	list_for_each_entry_safe(itrace_index, n, head, list) {
+		list_del(&itrace_index->list);
+		free(itrace_index);
+	}
+}
+
+static struct itrace_index *itrace_index__last(struct list_head *head)
+{
+	struct itrace_index *itrace_index;
+	int err;
+
+	if (list_empty(head)) {
+		err = itrace_index__alloc(head);
+		if (err)
+			return NULL;
+	}
+
+	itrace_index = list_entry(head->prev, struct itrace_index, list);
+
+	if (itrace_index->nr >= PERF_ITRACE_INDEX_ENTRY_COUNT) {
+		err = itrace_index__alloc(head);
+		if (err)
+			return NULL;
+		itrace_index = list_entry(head->prev, struct itrace_index,
+					  list);
+	}
+
+	return itrace_index;
+}
+
+int itrace_index__itrace_event(struct list_head *head, union perf_event *event,
+			       off_t file_offset)
+{
+	struct itrace_index *itrace_index;
+	size_t nr;
+
+	itrace_index = itrace_index__last(head);
+	if (!itrace_index)
+		return -ENOMEM;
+
+	nr = itrace_index->nr;
+	itrace_index->entries[nr].file_offset = file_offset;
+	itrace_index->entries[nr].sz = event->header.size;
+	itrace_index->nr += 1;
+
+	return 0;
+}
+
+static int itrace_index__do_write(int fd, struct itrace_index *itrace_index)
+{
+	struct itrace_index_entry index;
+	size_t i;
+
+	for (i = 0; i < itrace_index->nr; i++) {
+		index.file_offset = itrace_index->entries[i].file_offset;
+		index.sz = itrace_index->entries[i].sz;
+		if (writen(fd, &index, sizeof(index)) != sizeof(index))
+			return -errno;
+	}
+	return 0;
+}
+
+int itrace_index__write(int fd, struct list_head *head)
+{
+	struct itrace_index *itrace_index;
+	u64 total = 0;
+	int err;
+
+	list_for_each_entry(itrace_index, head, list)
+		total += itrace_index->nr;
+
+	if (writen(fd, &total, sizeof(total)) != sizeof(total))
+		return -errno;
+
+	list_for_each_entry(itrace_index, head, list) {
+		err = itrace_index__do_write(fd, itrace_index);
+		if (err)
+			return err;
+	}
+
+	return 0;
+}
+
+static int itrace_index__process_entry(int fd, struct list_head *head,
+				       bool needs_swap)
+{
+	struct itrace_index *itrace_index;
+	struct itrace_index_entry index;
+	size_t nr;
+
+	if (readn(fd, &index, sizeof(index)) != sizeof(index))
+		return -1;
+
+	itrace_index = itrace_index__last(head);
+	if (!itrace_index)
+		return -1;
+
+	nr = itrace_index->nr;
+	if (needs_swap) {
+		itrace_index->entries[nr].file_offset =
+						bswap_64(index.file_offset);
+		itrace_index->entries[nr].sz = bswap_64(index.sz);
+	} else {
+		itrace_index->entries[nr].file_offset = index.file_offset;
+		itrace_index->entries[nr].sz = index.sz;
+	}
+
+	itrace_index->nr = nr + 1;
+
+	return 0;
+}
+
+int itrace_index__process(int fd, u64 size, struct perf_session *session,
+			  bool needs_swap)
+{
+	struct list_head *head = &session->itrace_index;
+	u64 nr;
+
+	if (readn(fd, &nr, sizeof(u64)) != sizeof(u64))
+		return -1;
+
+	if (needs_swap)
+		nr = bswap_64(nr);
+
+	if (sizeof(u64) + nr * sizeof(struct itrace_index_entry) != size)
+		return -1;
+
+	while (nr--) {
+		int err;
+
+		err = itrace_index__process_entry(fd, head, needs_swap);
+		if (err)
+			return -1;
+	}
+
+	return 0;
+}
+
+static int itrace_queues__process_index_entry(struct itrace_queues *queues,
+					      struct perf_session *session,
+					      struct itrace_index_entry *index)
+{
+	return itrace_queues__add_indexed_event(queues, session,
+						index->file_offset, index->sz);
+}
+
+int itrace_queues__process_index(struct itrace_queues *queues,
+				 struct perf_session *session)
+{
+	struct itrace_index *itrace_index;
+	struct itrace_index_entry *index;
+	size_t i;
+	int err;
+
+	list_for_each_entry(itrace_index, &session->itrace_index, list) {
+		for (i = 0; i < itrace_index->nr; i++) {
+			index = &itrace_index->entries[i];
+			err = itrace_queues__process_index_entry(queues,
+								 session,
+								 index);
+			if (err)
+				return err;
+		}
+	}
+	return 0;
 }
 
 struct itrace_buffer *itrace_buffer__next(struct itrace_queue *queue,

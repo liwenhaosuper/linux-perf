@@ -117,8 +117,23 @@ static int record__process_itrace(struct perf_tool *tool,
 				  size_t len1, void *data2, size_t len2)
 {
 	struct record *rec = container_of(tool, struct record, tool);
+	struct perf_data_file *file = &rec->file;
 	size_t padding;
 	u8 pad[8] = {0};
+
+	if (!perf_data_file__is_pipe(file)) {
+		off_t file_offset;
+		int fd = perf_data_file__fd(file);
+		int err;
+
+		file_offset = lseek(fd, 0, SEEK_CUR);
+		if (file_offset == -1)
+			return -1;
+		err = itrace_index__itrace_event(&rec->session->itrace_index,
+						 event, file_offset);
+		if (err)
+			return err;
+	}
 
 	/* event.itrace.size includes padding, see __itrace_mmap__read() */
 	padding = (len1 + len2) & 7;

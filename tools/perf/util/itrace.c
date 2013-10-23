@@ -598,6 +598,29 @@ void itrace_record__free(struct itrace_record *itr)
 		itr->free(itr);
 }
 
+int itrace_record__snapshot_start(struct itrace_record *itr)
+{
+	if (itr && itr->snapshot_start)
+		return itr->snapshot_start(itr);
+	return 0;
+}
+
+int itrace_record__snapshot_finish(struct itrace_record *itr)
+{
+	if (itr && itr->snapshot_finish)
+		return itr->snapshot_finish(itr);
+	return 0;
+}
+
+int itrace_record__find_snapshot(struct itrace_record *itr, int idx,
+				 struct itrace_mmap *mm,
+				 unsigned char *data, u64 *head, u64 *old)
+{
+	if (itr && itr->find_snapshot)
+		return itr->find_snapshot(itr, idx, mm, data, head, old);
+	return 0;
+}
+
 int itrace_record__options(struct itrace_record *itr,
 			   struct perf_evlist *evlist,
 			   struct record_opts *opts)
@@ -662,6 +685,19 @@ int itrace_parse_sample_options(const struct option *opt, const char *str,
 out_free:
 	free(s);
 	return err;
+}
+
+int itrace_parse_snapshot_options(struct itrace_record *itr,
+				  struct record_opts *opts, const char *str)
+{
+	if (!str)
+		return 0;
+
+	if (itr)
+		return itr->parse_snapshot_options(itr, opts, str);
+
+	pr_err("No Instruction Tracing to snapshot\n");
+	return -EINVAL;
 }
 
 struct itrace_record *__weak
@@ -1205,15 +1241,25 @@ int perf_event__count_itrace_error(struct perf_tool *tool __maybe_unused,
 	return 0;
 }
 
-int itrace_mmap__read(struct itrace_mmap *mm, struct itrace_record *itr,
-		      struct perf_tool *tool, process_itrace_t fn)
+static int __itrace_mmap__read(struct itrace_mmap *mm,
+			       struct itrace_record *itr,
+			       struct perf_tool *tool, process_itrace_t fn,
+			       bool snapshot, size_t snapshot_size)
 {
-	u64 head = itrace_mmap__read_head(mm);
-	u64 old = mm->prev, offset, ref;
+	u64 head, old = mm->prev, offset, ref;
 	unsigned char *data = mm->base;
 	size_t size, head_off, old_off, len1, len2, padding;
 	union perf_event ev;
 	void *data1, *data2;
+
+	if (snapshot) {
+		head = itrace_mmap__read_snapshot_head(mm);
+		if (itrace_record__find_snapshot(itr, mm->idx, mm, data, &head,
+						 &old))
+			return -1;
+	} else {
+		head = itrace_mmap__read_head(mm);
+	}
 
 	if (old == head)
 		return 0;
@@ -1233,6 +1279,9 @@ int itrace_mmap__read(struct itrace_mmap *mm, struct itrace_record *itr,
 		size = head_off - old_off;
 	else
 		size = mm->len - (old_off - head_off);
+
+	if (snapshot && size > snapshot_size)
+		size = snapshot_size;
 
 	ref = itrace_record__reference(itr);
 
@@ -1281,16 +1330,32 @@ int itrace_mmap__read(struct itrace_mmap *mm, struct itrace_record *itr,
 
 	mm->prev = head;
 
-	itrace_mmap__write_tail(mm, head);
-	if (itr->read_finish) {
-		int err;
+	if (!snapshot) {
+		itrace_mmap__write_tail(mm, head);
+		if (itr->read_finish) {
+			int err;
 
-		err = itr->read_finish(itr, mm->idx);
-		if (err < 0)
-			return err;
+			err = itr->read_finish(itr, mm->idx);
+			if (err < 0)
+				return err;
+		}
 	}
 
 	return 1;
+}
+
+int itrace_mmap__read(struct itrace_mmap *mm, struct itrace_record *itr,
+		      struct perf_tool *tool, process_itrace_t fn)
+{
+	return __itrace_mmap__read(mm, itr, tool, fn, false, 0);
+}
+
+int itrace_mmap__read_snapshot(struct itrace_mmap *mm,
+			       struct itrace_record *itr,
+			       struct perf_tool *tool, process_itrace_t fn,
+			       size_t snapshot_size)
+{
+	return __itrace_mmap__read(mm, itr, tool, fn, true, snapshot_size);
 }
 
 /**

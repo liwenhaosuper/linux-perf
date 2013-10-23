@@ -227,6 +227,13 @@ is off by default.
 Enable AUX area sampling. An optional parameter string takes the form 'szname/options/'
 where sz in the sample size, and name and options depend on the data being sampled.
 
+-S::
+--snapshot::
+Select Instruction Tracing Snapshot Mode. This option is valid only with an
+Instruction Tracing event. Optionally the number of bytes to capture per
+snapshot can be specified. In Snapshot Mode, trace data is captured only when
+signal SIGUSR2 is received.
+
 SEE ALSO
 --------
 linkperf:perf-stat[1], linkperf:perf-list[1]

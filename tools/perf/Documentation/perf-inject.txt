@@ -44,6 +44,33 @@ OPTIONS
 --kallsyms=<file>::
 	kallsyms pathname
 
+-Z::
+--itrace::
+	Decode Instruction Tracing data, replacing it with synthesized events.
+	Options are:
+
+		i	synthesize instructions events
+		b	synthesize branches events
+		c	synthesize branches events (calls only)
+		r	synthesize branches events (returns only)
+		e	synthesize error events
+		d	create a debug log
+		g	synthesize a call chain for instructions events
+
+	The default is all events i.e. the same as -Zibe
+
+	In addition, the period (default 1000) for instructions events can be
+	specified in units of:
+
+		i	instructions (default)
+		t	ticks
+		ms	milliseconds
+		us	microseconds
+		ns	nanoseconds
+
+	Also the call chain size (default 16, max. 1024) for instructions
+	events can be specified.
+
 SEE ALSO
 --------
 linkperf:perf-record[1], linkperf:perf-report[1], linkperf:perf-archive[1]

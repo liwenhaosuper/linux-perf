@@ -38,19 +38,44 @@ struct event_entry {
 	union perf_event event[0];
 };
 
-static int perf_event__repipe_synth(struct perf_tool *tool,
-				    union perf_event *event)
+static int output_bytes(struct perf_inject *inject, void *buf, size_t sz)
 {
-	struct perf_inject *inject = container_of(tool, struct perf_inject, tool);
 	ssize_t size;
 
-	size = perf_data_file__write(&inject->output, event,
-				     event->header.size);
+	size = perf_data_file__write(&inject->output, buf, sz);
 	if (size < 0)
 		return -errno;
 
 	inject->bytes_written += size;
 	return 0;
+}
+
+static int copy_bytes(struct perf_inject *inject, int fd, off_t size)
+{
+	char buf[4096];
+	ssize_t ssz;
+	int ret;
+
+	while (size > 0) {
+		ssz = read(fd, buf, MIN(size, sizeof(buf)));
+		if (ssz < 0)
+			return -errno;
+		ret = output_bytes(inject, buf, ssz);
+		if (ret)
+			return ret;
+		size -= ssz;
+	}
+
+	return 0;
+}
+
+static int perf_event__repipe_synth(struct perf_tool *tool,
+				    union perf_event *event)
+{
+	struct perf_inject *inject = container_of(tool, struct perf_inject,
+						  tool);
+
+	return output_bytes(inject, event, event->header.size);
 }
 
 static int perf_event__repipe_op2_synth(struct perf_tool *tool,
@@ -77,6 +102,31 @@ static int perf_event__repipe_attr(struct perf_tool *tool,
 		return 0;
 
 	return perf_event__repipe_synth(tool, event);
+}
+
+static s64 perf_event__repipe_itrace(struct perf_tool *tool,
+				     union perf_event *event,
+				     struct perf_session *session
+				     __maybe_unused)
+{
+	struct perf_inject *inject = container_of(tool, struct perf_inject,
+						  tool);
+	int ret;
+
+	if (perf_data_file__is_pipe(session->file) || !session->one_mmap) {
+		ret = output_bytes(inject, event, event->header.size);
+		if (ret < 0)
+			return ret;
+		ret = copy_bytes(inject, perf_data_file__fd(session->file),
+				 event->itrace.size);
+	} else {
+		ret = output_bytes(inject, event,
+				   event->header.size + event->itrace.size);
+	}
+	if (ret < 0)
+		return ret;
+
+	return event->itrace.size;
 }
 
 static int perf_event__repipe(struct perf_tool *tool,
@@ -407,6 +457,9 @@ int cmd_inject(int argc, const char **argv, const char *prefix __maybe_unused)
 			.unthrottle	= perf_event__repipe,
 			.attr		= perf_event__repipe_attr,
 			.tracing_data	= perf_event__repipe_op2_synth,
+			.itrace_info	= perf_event__repipe_op2_synth,
+			.itrace		= perf_event__repipe_itrace,
+			.itrace_error	= perf_event__repipe_op2_synth,
 			.finished_round	= perf_event__repipe_op2_synth,
 			.build_id	= perf_event__repipe_op2_synth,
 			.id_index	= perf_event__repipe_op2_synth,

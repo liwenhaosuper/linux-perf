@@ -347,6 +347,91 @@ void itrace_queues__free(struct itrace_queues *queues)
 	queues->nr_queues = 0;
 }
 
+static void itrace_heapify(struct itrace_heap_item *heap_array,
+			   unsigned int pos, unsigned int queue_nr,
+			   u64 ordinal)
+{
+	unsigned int parent;
+
+	while (pos) {
+		parent = (pos - 1) >> 1;
+		if (heap_array[parent].ordinal <= ordinal)
+			break;
+		heap_array[pos] = heap_array[parent];
+		pos = parent;
+	}
+	heap_array[pos].queue_nr = queue_nr;
+	heap_array[pos].ordinal = ordinal;
+}
+
+int itrace_heap__add(struct itrace_heap *heap, unsigned int queue_nr,
+		     u64 ordinal)
+{
+	struct itrace_heap_item *heap_array;
+
+	if (queue_nr >= heap->heap_sz) {
+		unsigned int heap_sz = ITRACE_INIT_NR_QUEUES;
+
+		while (heap_sz <= queue_nr)
+			heap_sz <<= 1;
+		heap_array = realloc(heap->heap_array,
+				     heap_sz * sizeof(struct itrace_heap_item));
+		if (!heap_array)
+			return -ENOMEM;
+		heap->heap_array = heap_array;
+		heap->heap_sz = heap_sz;
+	}
+
+	itrace_heapify(heap->heap_array, heap->heap_cnt++, queue_nr, ordinal);
+
+	return 0;
+}
+
+void itrace_heap__free(struct itrace_heap *heap)
+{
+	zfree(&heap->heap_array);
+	heap->heap_cnt = 0;
+	heap->heap_sz = 0;
+}
+
+void itrace_heap__pop(struct itrace_heap *heap)
+{
+	unsigned int pos, last, heap_cnt = heap->heap_cnt;
+	struct itrace_heap_item *heap_array;
+
+	if (!heap_cnt)
+		return;
+
+	heap->heap_cnt -= 1;
+
+	heap_array = heap->heap_array;
+
+	pos = 0;
+	while (1) {
+		unsigned int left, right;
+
+		left = (pos << 1) + 1;
+		if (left >= heap_cnt)
+			break;
+		right = left + 1;
+		if (right >= heap_cnt) {
+			heap_array[pos] = heap_array[left];
+			return;
+		}
+		if (heap_array[left].ordinal < heap_array[right].ordinal) {
+			heap_array[pos] = heap_array[left];
+			pos = left;
+		} else {
+			heap_array[pos] = heap_array[right];
+			pos = right;
+		}
+	}
+
+	last = heap_cnt - 1;
+	itrace_heapify(heap_array, pos, heap_array[last].queue_nr,
+		       heap_array[last].ordinal);
+}
+
 size_t itrace_record__info_priv_size(struct itrace_record *itr)
 {
 	if (itr)

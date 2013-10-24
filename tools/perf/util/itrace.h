@@ -172,6 +172,29 @@ struct itrace_queues {
 };
 
 /**
+ * struct itrace_heap_item - element of struct itrace_heap.
+ * @queue_nr: queue number
+ * @ordinal: value used for sorting (lowest ordinal is top of the heap) expected
+ *           to be a timestamp
+ */
+struct itrace_heap_item {
+	unsigned int		queue_nr;
+	u64			ordinal;
+};
+
+/**
+ * struct itrace_heap - a heap suitable for sorting Instruction Tracing queues.
+ * @heap_array: the heap
+ * @heap_cnt: the number of elements in the heap
+ * @heap_sz: maximum number of elements (grows as needed)
+ */
+struct itrace_heap {
+	struct itrace_heap_item	*heap_array;
+	unsigned int		heap_cnt;
+	unsigned int		heap_sz;
+};
+
+/**
  * struct itrace_mmap - records an mmap of the itrace buffer.
  * @base: address of mapped area
  * @userpg: pointer to buffer's perf_event_mmap_page
@@ -280,6 +303,12 @@ void *itrace_buffer__get_data(struct itrace_buffer *buffer, int fd);
 void itrace_buffer__put_data(struct itrace_buffer *buffer);
 void itrace_buffer__drop_data(struct itrace_buffer *buffer);
 void itrace_buffer__free(struct itrace_buffer *buffer);
+
+int itrace_heap__add(struct itrace_heap *heap, unsigned int queue_nr,
+		     u64 ordinal);
+void itrace_heap__pop(struct itrace_heap *heap);
+void itrace_heap__free(struct itrace_heap *heap);
+
 struct itrace_record *itrace_record__init(struct perf_evlist *evlist, int *err);
 
 int itrace_record__options(struct itrace_record *itr,

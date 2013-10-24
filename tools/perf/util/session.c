@@ -15,6 +15,7 @@
 #include "cpumap.h"
 #include "perf_regs.h"
 #include "asm/bug.h"
+#include "itrace.h"
 
 static int perf_session__open(struct perf_session *session)
 {
@@ -166,6 +167,7 @@ static void perf_session_env__delete(struct perf_session_env *env)
 
 void perf_session__delete(struct perf_session *session)
 {
+	itrace__free(session);
 	perf_session__destroy_kernel_maps(session);
 	perf_session__delete_dead_threads(session);
 	perf_session__delete_threads(session);
@@ -929,10 +931,11 @@ perf_session__deliver_sample(struct perf_session *session,
 					    &sample->read.one, machine);
 }
 
-int perf_session__deliver_event(struct perf_session *session,
-				union perf_event *event,
-				struct perf_sample *sample,
-				struct perf_tool *tool, u64 file_offset)
+static int __perf_session__deliver_event(struct perf_session *session,
+					 union perf_event *event,
+					 struct perf_sample *sample,
+					 struct perf_tool *tool,
+					 u64 file_offset)
 {
 	struct perf_evsel *evsel;
 	struct machine *machine;
@@ -981,6 +984,24 @@ int perf_session__deliver_event(struct perf_session *session,
 		++session->stats.nr_unknown_events;
 		return -1;
 	}
+}
+
+int perf_session__deliver_event(struct perf_session *session,
+				union perf_event *event,
+				struct perf_sample *sample,
+				struct perf_tool *tool,
+				u64 file_offset)
+{
+	int ret;
+
+	ret = itrace__process_event(session, event, sample, tool);
+	if (ret < 0)
+		return ret;
+	if (ret > 0)
+		return 0;
+
+	return __perf_session__deliver_event(session, event, sample, tool,
+					     file_offset);
 }
 
 static s64 perf_session__process_user_event(struct perf_session *session,
@@ -1041,7 +1062,7 @@ int perf_session__deliver_synth_event(struct perf_session *session,
 	if (event->header.type >= PERF_RECORD_USER_TYPE_START)
 		return perf_session__process_user_event(session, event, tool, 0);
 
-	return perf_session__deliver_event(session, event, sample, tool, 0);
+	return __perf_session__deliver_event(session, event, sample, tool, 0);
 }
 
 static void event_swap(union perf_event *event, bool sample_id_all)
@@ -1211,6 +1232,11 @@ static void perf_session__warn_about_errors(const struct perf_session *session,
 
 	if (session->stats.nr_unordered_events != 0)
 		ui__warning("%u out of order events recorded.\n", session->stats.nr_unordered_events);
+
+	if (session->itrace && session->itrace->error_count) {
+		ui__warning("%llu instruction trace errors\n",
+			    session->itrace->error_count);
+	}
 }
 
 volatile int session_done;
@@ -1298,10 +1324,14 @@ more:
 done:
 	/* do the final flush for ordered samples */
 	err = ordered_events__flush(session, tool, OE_FLUSH__FINAL);
+	if (err)
+		goto out_err;
+	err = itrace__flush_events(session, tool);
 out_err:
 	free(buf);
 	perf_session__warn_about_errors(session, tool);
 	ordered_events__free(&session->ordered_events);
+	itrace__free_events(session);
 	return err;
 }
 
@@ -1443,10 +1473,14 @@ more:
 out:
 	/* do the final flush for ordered samples */
 	err = ordered_events__flush(session, tool, OE_FLUSH__FINAL);
+	if (err)
+		goto out_err;
+	err = itrace__flush_events(session, tool);
 out_err:
 	ui_progress__finish();
 	perf_session__warn_about_errors(session, tool);
 	ordered_events__free(&session->ordered_events);
+	itrace__free_events(session);
 	session->one_mmap = false;
 	return err;
 }
@@ -1528,7 +1562,13 @@ size_t perf_session__fprintf_dsos_buildid(struct perf_session *session, FILE *fp
 
 size_t perf_session__fprintf_nr_events(struct perf_session *session, FILE *fp)
 {
-	size_t ret = fprintf(fp, "Aggregated stats:\n");
+	size_t ret;
+	const char *msg = "";
+
+	if (perf_header__has_feat(&session->header, HEADER_ITRACE))
+		msg = " (excludes Instruction Trace decoded/synthesized events)";
+
+	ret = fprintf(fp, "Aggregated stats:%s\n", msg);
 
 	ret += events_stats__fprintf(&session->stats, fp);
 	return ret;

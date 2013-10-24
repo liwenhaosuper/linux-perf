@@ -23,6 +23,7 @@
 #include <linux/types.h>
 
 #include "../perf.h"
+#include "session.h"
 
 union perf_event;
 struct perf_session;
@@ -30,6 +31,26 @@ struct perf_evlist;
 struct perf_tool;
 struct record_opts;
 struct itrace_info_event;
+
+/**
+ * struct itrace - session callbacks to allow Instruction Trace data decoding.
+ * @process_event: lets the decoder see all session events
+ * @flush_events: process any remaining data
+ * @free_events: free resources associated with event processing
+ * @free: free resources associated with the session
+ * @error_count: number of errors
+ */
+struct itrace {
+	int (*process_event)(struct perf_session *session,
+			     union perf_event *event,
+			     struct perf_sample *sample,
+			     struct perf_tool *tool);
+	int (*flush_events)(struct perf_session *session,
+			    struct perf_tool *tool);
+	void (*free_events)(struct perf_session *session);
+	void (*free)(struct perf_session *session);
+	unsigned long long error_count;
+};
 
 /**
  * struct itrace_mmap - records an mmap of the itrace buffer.
@@ -149,5 +170,41 @@ int perf_event__synthesize_itrace(struct perf_tool *tool,
 				  perf_event__handler_t process,
 				  size_t size, u64 offset, u64 ref, int idx,
 				  u32 tid, u32 cpu);
+
+static inline int itrace__process_event(struct perf_session *session,
+					union perf_event *event,
+					struct perf_sample *sample,
+					struct perf_tool *tool)
+{
+	if (!session->itrace)
+		return 0;
+
+	return session->itrace->process_event(session, event, sample, tool);
+}
+
+static inline int itrace__flush_events(struct perf_session *session,
+				       struct perf_tool *tool)
+{
+	if (!session->itrace)
+		return 0;
+
+	return session->itrace->flush_events(session, tool);
+}
+
+static inline void itrace__free_events(struct perf_session *session)
+{
+	if (!session->itrace)
+		return;
+
+	return session->itrace->free_events(session);
+}
+
+static inline void itrace__free(struct perf_session *session)
+{
+	if (!session->itrace)
+		return;
+
+	return session->itrace->free(session);
+}
 
 #endif

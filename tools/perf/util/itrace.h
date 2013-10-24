@@ -19,6 +19,7 @@
 #include <sys/types.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <linux/list.h>
 #include <linux/perf_event.h>
 #include <linux/types.h>
 
@@ -94,6 +95,80 @@ struct itrace {
 	void (*free_events)(struct perf_session *session);
 	void (*free)(struct perf_session *session);
 	unsigned long long error_count;
+};
+
+/**
+ * struct itrace_buffer - a buffer containing Instruction Tracing data.
+ * @list: buffers are queued in a list held by struct itrace_queue
+ * @size: size of the buffer in bytes
+ * @pid: in per-thread mode, the pid this buffer is associated with
+ * @tid: in per-thread mode, the tid this buffer is associated with
+ * @cpu: in per-cpu mode, the cpu this buffer is associated with
+ * @data: actual buffer data (can be null if the data has not been loaded)
+ * @data_offset: file offset at which the buffer can be read
+ * @mmap_addr: mmap address at which the buffer can be read
+ * @mmap_size: size of the mmap at @mmap_addr
+ * @data_needs_freeing: @data was malloc'd so free it when it is no longer
+ *                      needed
+ * @consecutive: the original data was split up and this buffer is consecutive
+ *               to the previous buffer
+ * @offset: offset as determined by aux_head / aux_tail members of struct
+ *          perf_event_mmap_page
+ * @reference: an implementation-specific reference determined when the data is
+ *             recorded
+ * @buffer_nr: used to number each buffer
+ * @use_size: implementation actually only uses this number of bytes
+ * @use_data: implementation actually only uses data starting at this address
+ */
+struct itrace_buffer {
+	struct list_head	list;
+	size_t			size;
+	pid_t			pid;
+	pid_t			tid;
+	int			cpu;
+	void			*data;
+	off_t			data_offset;
+	void			*mmap_addr;
+	size_t			mmap_size;
+	bool			data_needs_freeing;
+	bool			consecutive;
+	u64			offset;
+	u64			reference;
+	u64			buffer_nr;
+	size_t			use_size;
+	void			*use_data;
+};
+
+/**
+ * struct itrace_queue - a queue of Instruction Tracing data buffers.
+ * @head: head of buffer list
+ * @tid: in per-thread mode, the tid this queue is associated with
+ * @cpu: in per-cpu mode, the cpu this queue is associated with
+ * @set: %true once this queue has been dedicated to a specific thread or cpu
+ * @priv: implementation-specific data
+ */
+struct itrace_queue {
+	struct list_head	head;
+	pid_t			tid;
+	int			cpu;
+	bool			set;
+	void			*priv;
+};
+
+/**
+ * struct itrace_queues - an array of Instruction Tracing queues.
+ * @queue_array: array of queues
+ * @nr_queues: number of queues
+ * @new_data: set whenever new data is queued
+ * @populated: queues have been fully populated using the itrace_index
+ * @next_buffer_nr: used to number each buffer
+ */
+struct itrace_queues {
+	struct itrace_queue	*queue_array;
+	unsigned int		nr_queues;
+	bool			new_data;
+	bool			populated;
+	u64			next_buffer_nr;
 };
 
 /**
@@ -193,6 +268,18 @@ typedef int (*process_itrace_t)(struct perf_tool *tool, union perf_event *event,
 int itrace_mmap__read(struct itrace_mmap *mm, struct itrace_record *itr,
 		      struct perf_tool *tool, process_itrace_t fn);
 
+int itrace_queues__init(struct itrace_queues *queues);
+int itrace_queues__add_event(struct itrace_queues *queues,
+			     struct perf_session *session,
+			     union perf_event *event, off_t data_offset,
+			     struct itrace_buffer **buffer_ptr);
+void itrace_queues__free(struct itrace_queues *queues);
+struct itrace_buffer *itrace_buffer__next(struct itrace_queue *queue,
+					  struct itrace_buffer *buffer);
+void *itrace_buffer__get_data(struct itrace_buffer *buffer, int fd);
+void itrace_buffer__put_data(struct itrace_buffer *buffer);
+void itrace_buffer__drop_data(struct itrace_buffer *buffer);
+void itrace_buffer__free(struct itrace_buffer *buffer);
 struct itrace_record *itrace_record__init(struct perf_evlist *evlist, int *err);
 
 int itrace_record__options(struct itrace_record *itr,

@@ -22,6 +22,7 @@
 #include <linux/types.h>
 
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <errno.h>
 
@@ -33,6 +34,7 @@
 #include "itrace.h"
 
 #include "event.h"
+#include "session.h"
 #include "debug.h"
 #include "parse-options.h"
 
@@ -156,6 +158,28 @@ itrace_record__init(struct perf_evlist *evlist __maybe_unused, int *err)
 {
 	*err = 0;
 	return NULL;
+}
+
+void itrace_synth_error(struct itrace_error_event *itrace_error, int type,
+			int code, int cpu, pid_t pid, pid_t tid, u64 ip,
+			const char *msg)
+{
+	size_t size;
+
+	memset(itrace_error, 0, sizeof(struct itrace_error_event));
+
+	itrace_error->header.type = PERF_RECORD_ITRACE_ERROR;
+	itrace_error->type = type;
+	itrace_error->code = code;
+	itrace_error->cpu = cpu;
+	itrace_error->pid = pid;
+	itrace_error->tid = tid;
+	itrace_error->ip = ip;
+	strlcpy(itrace_error->msg, msg, MAX_ITRACE_ERROR_MSG);
+
+	size = (void *)itrace_error->msg - (void *)itrace_error +
+	       strlen(itrace_error->msg) + 1;
+	itrace_error->header.size = PERF_ALIGN(size, sizeof(u64));
 }
 
 int perf_event__synthesize_itrace_info(struct itrace_record *itr,
@@ -335,6 +359,37 @@ out:
 out_err:
 	pr_err("Bad instruction trace options '%s'\n", str);
 	return -EINVAL;
+}
+
+size_t perf_event__fprintf_itrace_error(union perf_event *event, FILE *fp)
+{
+	struct itrace_error_event *e = &event->itrace_error;
+	int ret;
+
+	ret = fprintf(fp, " Instruction trace error type %u", e->type);
+	ret += fprintf(fp, " cpu %d pid %d tid %d ip %#"PRIx64" code %u: %s\n",
+		       e->cpu, e->pid, e->tid, e->ip, e->code, e->msg);
+	return ret;
+}
+
+int perf_event__process_itrace_error(struct perf_tool *tool __maybe_unused,
+				     union perf_event *event,
+				     struct perf_session *session)
+{
+	if (session->itrace)
+		session->itrace->error_count += 1;
+
+	perf_event__fprintf_itrace_error(event, stdout);
+	return 0;
+}
+
+int perf_event__count_itrace_error(struct perf_tool *tool __maybe_unused,
+				   union perf_event *event __maybe_unused,
+				   struct perf_session *session)
+{
+	if (session->itrace)
+		session->itrace->error_count += 1;
+	return 0;
 }
 
 int itrace_mmap__read(struct itrace_mmap *mm, struct itrace_record *itr,

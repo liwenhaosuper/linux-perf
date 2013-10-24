@@ -33,6 +33,10 @@ struct option;
 struct record_opts;
 struct itrace_info_event;
 
+enum itrace_error_type {
+	PERF_ITRACE_DECODER_ERROR = 1,
+};
+
 enum itrace_period_type {
 	PERF_ITRACE_PERIOD_INSTRUCTIONS,
 	PERF_ITRACE_PERIOD_TICKS,
@@ -202,6 +206,10 @@ int itrace_record__info_fill(struct itrace_record *itr,
 void itrace_record__free(struct itrace_record *itr);
 u64 itrace_record__reference(struct itrace_record *itr);
 
+void itrace_synth_error(struct itrace_error_event *itrace_error, int type,
+			int code, int cpu, pid_t pid, pid_t tid, u64 ip,
+			const char *msg);
+
 int perf_event__synthesize_itrace_info(struct itrace_record *itr,
 				       struct perf_tool *tool,
 				       struct perf_session *session,
@@ -210,9 +218,17 @@ int perf_event__synthesize_itrace(struct perf_tool *tool,
 				  perf_event__handler_t process,
 				  size_t size, u64 offset, u64 ref, int idx,
 				  u32 tid, u32 cpu);
+int perf_event__process_itrace_error(struct perf_tool *tool,
+				     union perf_event *event,
+				     struct perf_session *session);
+int perf_event__count_itrace_error(struct perf_tool *tool __maybe_unused,
+				   union perf_event *event __maybe_unused,
+				   struct perf_session *session);
 int itrace_parse_synth_opts(const struct option *opt, const char *str,
 			    int unset);
 void itrace_synth_opts__set_default(struct itrace_synth_opts *synth_opts);
+
+size_t perf_event__fprintf_itrace_error(union perf_event *event, FILE *fp);
 
 static inline int itrace__process_event(struct perf_session *session,
 					union perf_event *event,

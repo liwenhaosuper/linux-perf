@@ -34,6 +34,10 @@ struct option;
 struct record_opts;
 struct itrace_info_event;
 
+enum itrace_type {
+	PERF_ITRACE_UNKNOWN,
+};
+
 enum itrace_error_type {
 	PERF_ITRACE_DECODER_ERROR = 1,
 };
@@ -90,6 +94,9 @@ struct itrace {
 			     union perf_event *event,
 			     struct perf_sample *sample,
 			     struct perf_tool *tool);
+	int (*process_itrace_event)(struct perf_session *session,
+				    union perf_event *event,
+				    struct perf_tool *tool);
 	int (*flush_events)(struct perf_session *session,
 			    struct perf_tool *tool);
 	void (*free_events)(struct perf_session *session);
@@ -330,10 +337,16 @@ int perf_event__synthesize_itrace_info(struct itrace_record *itr,
 				       struct perf_tool *tool,
 				       struct perf_session *session,
 				       perf_event__handler_t process);
+int perf_event__process_itrace_info(struct perf_tool *tool,
+				    union perf_event *event,
+				    struct perf_session *session);
 int perf_event__synthesize_itrace(struct perf_tool *tool,
 				  perf_event__handler_t process,
 				  size_t size, u64 offset, u64 ref, int idx,
 				  u32 tid, u32 cpu);
+s64 perf_event__process_itrace(struct perf_tool *tool,
+			       union perf_event *event,
+			       struct perf_session *session);
 int perf_event__process_itrace_error(struct perf_tool *tool,
 				     union perf_event *event,
 				     struct perf_session *session);

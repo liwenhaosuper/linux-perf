@@ -600,6 +600,28 @@ out_free:
 	return err;
 }
 
+static bool itrace__dont_decode(struct perf_session *session)
+{
+	return !session->itrace_synth_opts ||
+	       session->itrace_synth_opts->dont_decode;
+}
+
+int perf_event__process_itrace_info(struct perf_tool *tool __maybe_unused,
+				    union perf_event *event,
+				    struct perf_session *session __maybe_unused)
+{
+	enum itrace_type type = event->itrace_info.type;
+
+	if (dump_trace)
+		fprintf(stdout, " type: %u\n", type);
+
+	switch (type) {
+	case PERF_ITRACE_UNKNOWN:
+	default:
+		return -EINVAL;
+	}
+}
+
 int perf_event__synthesize_itrace(struct perf_tool *tool,
 				  perf_event__handler_t process,
 				  size_t size, u64 offset, u64 ref, int idx,
@@ -618,6 +640,30 @@ int perf_event__synthesize_itrace(struct perf_tool *tool,
 	ev.itrace.cpu = cpu;
 
 	return process(tool, &ev, NULL, NULL);
+}
+
+s64 perf_event__process_itrace(struct perf_tool *tool, union perf_event *event,
+			       struct perf_session *session)
+{
+	s64 err;
+
+	if (dump_trace)
+		fprintf(stdout, " size: %#"PRIx64"  offset: %#"PRIx64"  ref: %#"PRIx64"  idx: %u  tid: %d  cpu: %d\n",
+			event->itrace.size, event->itrace.offset,
+			event->itrace.reference, event->itrace.idx,
+			event->itrace.tid, event->itrace.cpu);
+
+	if (itrace__dont_decode(session))
+		return event->itrace.size;
+
+	if (!session->itrace || event->header.type != PERF_RECORD_ITRACE)
+		return -EINVAL;
+
+	err = session->itrace->process_itrace_event(session, event, tool);
+	if (err < 0)
+		return err;
+
+	return event->itrace.size;
 }
 
 #define PERF_ITRACE_DEFAULT_PERIOD_TYPE		PERF_ITRACE_PERIOD_NANOSECS
@@ -765,6 +811,9 @@ int perf_event__process_itrace_error(struct perf_tool *tool __maybe_unused,
 				     union perf_event *event,
 				     struct perf_session *session)
 {
+	if (itrace__dont_decode(session))
+		return 0;
+
 	if (session->itrace)
 		session->itrace->error_count += 1;
 

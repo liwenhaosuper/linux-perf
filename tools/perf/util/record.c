@@ -119,7 +119,7 @@ void perf_evlist__config(struct perf_evlist *evlist, struct record_opts *opts)
 			evsel->attr.comm_exec = 1;
 	}
 
-	if (opts->full_itrace) {
+	if (record_opts__itracing(opts)) {
 		/*
 		 * Need to be able to synthesize and parse selected events with
 		 * arbitrary sample types, which requires always being able to

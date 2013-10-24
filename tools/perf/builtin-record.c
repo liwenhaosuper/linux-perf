@@ -357,7 +357,7 @@ static void record__init_features(struct record *rec)
 	if (!rec->opts.branch_stack)
 		perf_header__clear_feat(&session->header, HEADER_BRANCH_STACK);
 
-	if (!rec->opts.full_itrace)
+	if (!record_opts__itracing(&rec->opts))
 		perf_header__clear_feat(&session->header, HEADER_ITRACE);
 }
 
@@ -474,7 +474,7 @@ static int __cmd_record(struct record *rec, int argc, const char **argv)
 		}
 	}
 
-	if (rec->opts.full_itrace) {
+	if (record_opts__itracing(&rec->opts)) {
 		err = perf_event__synthesize_itrace_info(rec->itr, tool,
 					session, process_synthesized_event);
 		if (err)
@@ -620,7 +620,7 @@ out_child:
 			 * Instruction Tracing data because we do not decode the
 			 * trace because it would take too long.
 			 */
-			if (rec->opts.full_itrace)
+			if (record_opts__itracing(&rec->opts))
 				dsos__hit_all(rec->session);
 		}
 		perf_session__write_header(rec->session, rec->evlist,
@@ -968,7 +968,7 @@ int cmd_record(int argc, const char **argv, const char *prefix __maybe_unused)
 	}
 
 	if (!rec->itr) {
-		rec->itr = itrace_record__init(rec->evlist, &err);
+		rec->itr = itrace_record__init(rec->evlist, NULL, &err);
 		if (err)
 			return err;
 	}

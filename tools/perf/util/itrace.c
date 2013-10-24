@@ -362,6 +362,109 @@ out:
 	return err;
 }
 
+struct itrace_queue *itrace_queues__sample_queue(struct itrace_queues *queues,
+						 struct perf_sample *sample,
+						 struct perf_session *session)
+{
+	struct perf_sample_id *sid;
+	unsigned int idx;
+	u64 id;
+
+	id = sample->id;
+	if (!id)
+		return NULL;
+
+	sid = perf_evlist__id2sid(session->evlist, id);
+	if (!sid)
+		return NULL;
+
+	idx = sid->idx;
+
+	if (idx >= queues->nr_queues)
+		return NULL;
+
+	return &queues->queue_array[idx];
+}
+
+int itrace_queues__add_sample(struct itrace_queues *queues,
+			      struct perf_sample *sample,
+			      struct perf_session *session,
+			      unsigned int *queue_nr, u64 ref)
+{
+	struct itrace_buffer *buffer;
+	struct itrace_queue *queue;
+	struct perf_sample_id *sid;
+	unsigned int idx;
+	int err;
+	u64 id;
+
+	id = sample->id;
+	if (!id)
+		return -EINVAL;
+
+	sid = perf_evlist__id2sid(session->evlist, id);
+	if (!sid)
+		return -ENOENT;
+
+	idx = sid->idx;
+
+	if (idx >= queues->nr_queues) {
+		err = itrace_queues__grow(queues, idx);
+		if (err)
+			return err;
+	}
+
+	queue = &queues->queue_array[idx];
+
+	if (!queue->set) {
+		queue->set = true;
+		queue->cpu = sid->cpu;
+		queue->tid = sid->tid;
+	} else if (sid->cpu != queue->cpu || sid->tid != queue->tid) {
+		pr_err("itrace queue conflicts with event (id %"PRIu64"):", id);
+		pr_err(" cpu %d, tid %d vs cpu %d, tid %d\n",
+		       queue->cpu, queue->tid, sid->cpu, sid->tid);
+		return -EINVAL;
+	}
+
+	buffer = zalloc(sizeof(struct itrace_buffer));
+	if (!buffer)
+		return -ENOMEM;
+
+	buffer->cpu = sample->cpu;
+	buffer->pid = sample->pid;
+	buffer->tid = sample->tid;
+	buffer->reference = ref;
+
+	if (perf_data_file__is_pipe(session->file) || !session->one_mmap) {
+		void *data = memdup(sample->aux_sample.data,
+				    sample->aux_sample.size);
+
+		if (!data) {
+			free(buffer);
+			return -ENOMEM;
+		}
+		buffer->size = sample->aux_sample.size;
+		buffer->data = data;
+		buffer->data_needs_freeing = true;
+	} else {
+		buffer->size = sample->aux_sample.size;
+		buffer->data = sample->aux_sample.data;
+	}
+
+	buffer->buffer_nr = queues->next_buffer_nr++;
+
+	list_add_tail(&buffer->list, &queue->head);
+
+	queues->new_data = true;
+	queues->populated = true;
+
+	if (queue_nr)
+		*queue_nr = idx;
+
+	return 0;
+}
+
 void itrace_queues__free(struct itrace_queues *queues)
 {
 	unsigned int i;
@@ -511,8 +614,59 @@ u64 itrace_record__reference(struct itrace_record *itr)
 	return 0;
 }
 
+int itrace_parse_sample_options(const struct option *opt, const char *str,
+				int unset)
+{
+	struct itrace_record **itr = (struct itrace_record **)opt->data;
+	struct record_opts *opts = opt->value;
+	char *s, *name, *opt_str, *p;
+	char *endptr;
+	size_t sz;
+	int err;
+
+	if (unset)
+		return 0;
+
+	/* Cut str into sz, name and opt_str based on -Aszname/opt_str/ */
+
+	s = str ? strdup(str) : strdup("");
+	if (!s)
+		return -ENOMEM;
+
+	sz = strtoul(s, &endptr, 0);
+	if (sz)
+		name = endptr;
+	else
+		name = s;
+
+	opt_str = strchr(name, '/');
+	if (opt_str) {
+		*opt_str++ = '\0';
+		p = strchr(opt_str, '/');
+		if (p && !p[1])
+			*p = '\0';
+	} else {
+		opt_str = NULL;
+	}
+
+	if (!*itr) {
+		*itr = itrace_record__init(NULL, name, &err);
+		if (err)
+			goto out_free;
+	}
+
+	if (*itr)
+		err = (*itr)->parse_sample_options(*itr, sz, opts, opt_str);
+	else
+		err = itrace_not_supported();
+out_free:
+	free(s);
+	return err;
+}
+
 struct itrace_record *__weak
-itrace_record__init(struct perf_evlist *evlist __maybe_unused, int *err)
+itrace_record__init(struct perf_evlist *evlist __maybe_unused,
+		    const char *name __maybe_unused, int *err)
 {
 	*err = 0;
 	return NULL;

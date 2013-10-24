@@ -237,6 +237,40 @@ static int process_id_index_stub(struct perf_tool *tool __maybe_unused,
 	return 0;
 }
 
+static int process_event_itrace_info_stub(struct perf_tool *tool __maybe_unused,
+				  union perf_event *event __maybe_unused,
+				  struct perf_session *session __maybe_unused)
+{
+	dump_printf(": unhandled!\n");
+	return 0;
+}
+
+static int skipn(int fd, off_t n)
+{
+	char buf[4096];
+	ssize_t ret;
+
+	while (n > 0) {
+		ret = read(fd, buf, MIN(n, sizeof(buf)));
+		if (ret <= 0)
+			return ret;
+		n -= ret;
+	}
+
+	return 0;
+}
+
+static s64 process_event_itrace_stub(struct perf_tool *tool __maybe_unused,
+				     union perf_event *event,
+				     struct perf_session *session
+				     __maybe_unused)
+{
+	dump_printf(": unhandled!\n");
+	if (perf_data_file__is_pipe(session->file))
+		skipn(perf_data_file__fd(session->file), event->itrace.size);
+	return event->itrace.size;
+}
+
 void perf_tool__fill_defaults(struct perf_tool *tool)
 {
 	if (tool->sample == NULL)
@@ -273,6 +307,10 @@ void perf_tool__fill_defaults(struct perf_tool *tool)
 	}
 	if (tool->id_index == NULL)
 		tool->id_index = process_id_index_stub;
+	if (tool->itrace_info == NULL)
+		tool->itrace_info = process_event_itrace_info_stub;
+	if (tool->itrace == NULL)
+		tool->itrace = process_event_itrace_stub;
 }
  
 static void swap_sample_id_all(union perf_event *event, void *data)
@@ -453,6 +491,29 @@ static void perf_event__tracing_data_swap(union perf_event *event,
 	event->tracing_data.size = bswap_32(event->tracing_data.size);
 }
 
+static void perf_event__itrace_info_swap(union perf_event *event,
+					 bool sample_id_all __maybe_unused)
+{
+	size_t size;
+
+	event->itrace_info.type = bswap_32(event->itrace_info.type);
+
+	size = event->header.size;
+	size -= (void *)&event->itrace_info.priv - (void *)event;
+	mem_bswap_64(event->itrace_info.priv, size);
+}
+
+static void perf_event__itrace_swap(union perf_event *event,
+				    bool sample_id_all __maybe_unused)
+{
+	event->itrace.size      = bswap_64(event->itrace.size);
+	event->itrace.offset    = bswap_64(event->itrace.offset);
+	event->itrace.reference = bswap_64(event->itrace.reference);
+	event->itrace.idx       = bswap_32(event->itrace.idx);
+	event->itrace.tid       = bswap_32(event->itrace.tid);
+	event->itrace.cpu       = bswap_32(event->itrace.cpu);
+}
+
 typedef void (*perf_event__swap_op)(union perf_event *event,
 				    bool sample_id_all);
 
@@ -472,6 +533,8 @@ static perf_event__swap_op perf_event__swap_ops[] = {
 	[PERF_RECORD_HEADER_TRACING_DATA] = perf_event__tracing_data_swap,
 	[PERF_RECORD_HEADER_BUILD_ID]	  = NULL,
 	[PERF_RECORD_ID_INDEX]		  = perf_event__all64_swap,
+	[PERF_RECORD_ITRACE_INFO]	  = perf_event__itrace_info_swap,
+	[PERF_RECORD_ITRACE]		  = perf_event__itrace_swap,
 	[PERF_RECORD_HEADER_MAX]	  = NULL,
 };
 
@@ -932,6 +995,12 @@ static s64 perf_session__process_user_event(struct perf_session *session,
 		return tool->finished_round(tool, event, session);
 	case PERF_RECORD_ID_INDEX:
 		return tool->id_index(tool, event, session);
+	case PERF_RECORD_ITRACE_INFO:
+		return tool->itrace_info(tool, event, session);
+	case PERF_RECORD_ITRACE:
+		/* setup for reading amidst mmap */
+		lseek(fd, file_offset + event->header.size, SEEK_SET);
+		return tool->itrace(tool, event, session);
 	default:
 		return -EINVAL;
 	}

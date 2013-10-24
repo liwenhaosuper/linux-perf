@@ -21,12 +21,19 @@
 #include <linux/perf_event.h>
 #include <linux/types.h>
 
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+
 #include "../perf.h"
 #include "util.h"
 #include "evlist.h"
 #include "cpumap.h"
 #include "thread_map.h"
 #include "itrace.h"
+
+#include "event.h"
+#include "debug.h"
 
 int itrace_mmap__mmap(struct itrace_mmap *mm, struct itrace_mmap_params *mp,
 		      void *userpg, int fd)
@@ -96,4 +103,193 @@ void itrace_mmap_params__set_idx(struct itrace_mmap_params *mp,
 		mp->cpu = -1;
 		mp->tid = evlist->threads->map[idx];
 	}
+}
+
+size_t itrace_record__info_priv_size(struct itrace_record *itr)
+{
+	if (itr)
+		return itr->info_priv_size(itr);
+	return 0;
+}
+
+static int itrace_not_supported(void)
+{
+	pr_err("Instruction tracing is not supported on this architecture\n");
+	return -EINVAL;
+}
+
+int itrace_record__info_fill(struct itrace_record *itr,
+			     struct perf_session *session,
+			     struct itrace_info_event *itrace_info,
+			     size_t priv_size)
+{
+	if (itr)
+		return itr->info_fill(itr, session, itrace_info, priv_size);
+	return itrace_not_supported();
+}
+
+void itrace_record__free(struct itrace_record *itr)
+{
+	if (itr)
+		itr->free(itr);
+}
+
+int itrace_record__options(struct itrace_record *itr,
+			   struct perf_evlist *evlist,
+			   struct record_opts *opts)
+{
+	if (itr)
+		return itr->recording_options(itr, evlist, opts);
+	return 0;
+}
+
+u64 itrace_record__reference(struct itrace_record *itr)
+{
+	if (itr)
+		return itr->reference(itr);
+	return 0;
+}
+
+struct itrace_record *__weak
+itrace_record__init(struct perf_evlist *evlist __maybe_unused, int *err)
+{
+	*err = 0;
+	return NULL;
+}
+
+int perf_event__synthesize_itrace_info(struct itrace_record *itr,
+				       struct perf_tool *tool,
+				       struct perf_session *session,
+				       perf_event__handler_t process)
+{
+	union perf_event *ev;
+	size_t priv_size;
+	int err;
+
+	pr_debug2("Synthesizing itrace information\n");
+	priv_size = itrace_record__info_priv_size(itr);
+	ev = zalloc(sizeof(struct itrace_info_event) + priv_size);
+	if (!ev)
+		return -ENOMEM;
+
+	ev->itrace_info.header.type = PERF_RECORD_ITRACE_INFO;
+	ev->itrace_info.header.size = sizeof(struct itrace_info_event) +
+				      priv_size;
+	err = itrace_record__info_fill(itr, session, &ev->itrace_info,
+				       priv_size);
+	if (err)
+		goto out_free;
+
+	err = process(tool, ev, NULL, NULL);
+out_free:
+	free(ev);
+	return err;
+}
+
+int perf_event__synthesize_itrace(struct perf_tool *tool,
+				  perf_event__handler_t process,
+				  size_t size, u64 offset, u64 ref, int idx,
+				  u32 tid, u32 cpu)
+{
+	union perf_event ev;
+
+	memset(&ev, 0, sizeof(ev));
+	ev.itrace.header.type = PERF_RECORD_ITRACE;
+	ev.itrace.header.size = sizeof(ev.itrace);
+	ev.itrace.size = size;
+	ev.itrace.offset = offset;
+	ev.itrace.reference = ref;
+	ev.itrace.idx = idx;
+	ev.itrace.tid = tid;
+	ev.itrace.cpu = cpu;
+
+	return process(tool, &ev, NULL, NULL);
+}
+
+int itrace_mmap__read(struct itrace_mmap *mm, struct itrace_record *itr,
+		      struct perf_tool *tool, process_itrace_t fn)
+{
+	u64 head = itrace_mmap__read_head(mm);
+	u64 old = mm->prev, offset, ref;
+	unsigned char *data = mm->base;
+	size_t size, head_off, old_off, len1, len2, padding;
+	union perf_event ev;
+	void *data1, *data2;
+
+	if (old == head)
+		return 0;
+
+	pr_debug3("itrace idx %d old %#"PRIx64" head %#"PRIx64" diff %#"PRIx64"\n",
+		  mm->idx, old, head, head - old);
+
+	if (mm->mask) {
+		head_off = head & mm->mask;
+		old_off = old & mm->mask;
+	} else {
+		head_off = head % mm->len;
+		old_off = old % mm->len;
+	}
+
+	if (head_off > old_off)
+		size = head_off - old_off;
+	else
+		size = mm->len - (old_off - head_off);
+
+	ref = itrace_record__reference(itr);
+
+	if (head > old || size <= head || mm->mask) {
+		offset = head - size;
+	} else {
+		/*
+		 * When the buffer size is not a power of 2, 'head' wraps at the
+		 * highest multiple of the buffer size, so we have to subtract
+		 * the remainder here.
+		 */
+		u64 rem = (0ULL - mm->len) % mm->len;
+
+		offset = head - size - rem;
+	}
+
+	if (size > head_off) {
+		len1 = size - head_off;
+		data1 = &data[mm->len - len1];
+		len2 = head_off;
+		data2 = &data[0];
+	} else {
+		len1 = size;
+		data1 = &data[head_off - len1];
+		len2 = 0;
+		data2 = NULL;
+	}
+
+	/* padding must be written by fn() e.g. record__process_itrace() */
+	padding = size & 7;
+	if (padding)
+		padding = 8 - padding;
+
+	memset(&ev, 0, sizeof(ev));
+	ev.itrace.header.type = PERF_RECORD_ITRACE;
+	ev.itrace.header.size = sizeof(ev.itrace);
+	ev.itrace.size = size + padding;
+	ev.itrace.offset = offset;
+	ev.itrace.reference = ref;
+	ev.itrace.idx = mm->idx;
+	ev.itrace.tid = mm->tid;
+	ev.itrace.cpu = mm->cpu;
+
+	if (fn(tool, &ev, data1, len1, data2, len2))
+		return -1;
+
+	mm->prev = head;
+
+	itrace_mmap__write_tail(mm, head);
+	if (itr->read_finish) {
+		int err;
+
+		err = itr->read_finish(itr, mm->idx);
+		if (err < 0)
+			return err;
+	}
+
+	return 1;
 }

@@ -53,8 +53,10 @@ struct record_opts {
 	bool	     sample_time;
 	bool	     period;
 	bool	     sample_intr_regs;
+	bool	     full_itrace;
 	unsigned int freq;
 	unsigned int mmap_pages;
+	unsigned int itrace_mmap_pages;
 	unsigned int user_freq;
 	u64          branch_stack;
 	u64	     default_interval;

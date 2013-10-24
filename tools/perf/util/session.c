@@ -271,6 +271,15 @@ static s64 process_event_itrace_stub(struct perf_tool *tool __maybe_unused,
 	return event->itrace.size;
 }
 
+static
+int process_event_itrace_error_stub(struct perf_tool *tool __maybe_unused,
+				    union perf_event *event __maybe_unused,
+				    struct perf_session *session __maybe_unused)
+{
+	dump_printf(": unhandled!\n");
+	return 0;
+}
+
 void perf_tool__fill_defaults(struct perf_tool *tool)
 {
 	if (tool->sample == NULL)
@@ -311,6 +320,8 @@ void perf_tool__fill_defaults(struct perf_tool *tool)
 		tool->itrace_info = process_event_itrace_info_stub;
 	if (tool->itrace == NULL)
 		tool->itrace = process_event_itrace_stub;
+	if (tool->itrace_error == NULL)
+		tool->itrace_error = process_event_itrace_error_stub;
 }
  
 static void swap_sample_id_all(union perf_event *event, void *data)
@@ -514,6 +525,17 @@ static void perf_event__itrace_swap(union perf_event *event,
 	event->itrace.cpu       = bswap_32(event->itrace.cpu);
 }
 
+static void perf_event__itrace_error_swap(union perf_event *event,
+					  bool sample_id_all __maybe_unused)
+{
+	event->itrace_error.type = bswap_32(event->itrace_error.type);
+	event->itrace_error.code = bswap_32(event->itrace_error.code);
+	event->itrace_error.cpu  = bswap_32(event->itrace_error.cpu);
+	event->itrace_error.pid  = bswap_32(event->itrace_error.pid);
+	event->itrace_error.tid  = bswap_32(event->itrace_error.tid);
+	event->itrace_error.ip   = bswap_64(event->itrace_error.ip);
+}
+
 typedef void (*perf_event__swap_op)(union perf_event *event,
 				    bool sample_id_all);
 
@@ -535,6 +557,7 @@ static perf_event__swap_op perf_event__swap_ops[] = {
 	[PERF_RECORD_ID_INDEX]		  = perf_event__all64_swap,
 	[PERF_RECORD_ITRACE_INFO]	  = perf_event__itrace_info_swap,
 	[PERF_RECORD_ITRACE]		  = perf_event__itrace_swap,
+	[PERF_RECORD_ITRACE_ERROR]	  = perf_event__itrace_error_swap,
 	[PERF_RECORD_HEADER_MAX]	  = NULL,
 };
 
@@ -1001,6 +1024,8 @@ static s64 perf_session__process_user_event(struct perf_session *session,
 		/* setup for reading amidst mmap */
 		lseek(fd, file_offset + event->header.size, SEEK_SET);
 		return tool->itrace(tool, event, session);
+	case PERF_RECORD_ITRACE_ERROR:
+		return tool->itrace_error(tool, event, session);
 	default:
 		return -EINVAL;
 	}

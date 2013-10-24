@@ -31,6 +31,7 @@ static const char *perf_event__names[] = {
 	[PERF_RECORD_ID_INDEX]			= "ID_INDEX",
 	[PERF_RECORD_ITRACE_INFO]		= "ITRACE_INFO",
 	[PERF_RECORD_ITRACE]			= "ITRACE",
+	[PERF_RECORD_ITRACE_ERROR]		= "ITRACE_ERROR",
 };
 
 const char *perf_event__name(unsigned int id)

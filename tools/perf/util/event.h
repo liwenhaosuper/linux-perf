@@ -217,6 +217,7 @@ enum perf_user_event_type { /* above any possible kernel type */
 	PERF_RECORD_ID_INDEX			= 69,
 	PERF_RECORD_ITRACE_INFO			= 70,
 	PERF_RECORD_ITRACE			= 71,
+	PERF_RECORD_ITRACE_ERROR		= 72,
 	PERF_RECORD_HEADER_MAX
 };
 
@@ -301,6 +302,20 @@ struct itrace_event {
 	u32 reserved__; /* For alignment */
 };
 
+#define MAX_ITRACE_ERROR_MSG 64
+
+struct itrace_error_event {
+	struct perf_event_header header;
+	u32 type;
+	u32 code;
+	u32 cpu;
+	u32 pid;
+	u32 tid;
+	u32 reserved__; /* For alignment */
+	u64 ip;
+	char msg[MAX_ITRACE_ERROR_MSG];
+};
+
 union perf_event {
 	struct perf_event_header	header;
 	struct mmap_event		mmap;
@@ -318,6 +333,7 @@ union perf_event {
 	struct id_index_event		id_index;
 	struct itrace_info_event	itrace_info;
 	struct itrace_event		itrace;
+	struct itrace_error_event	itrace_error;
 };
 
 void perf_event__print_totals(void);

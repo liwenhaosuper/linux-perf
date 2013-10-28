@@ -100,6 +100,7 @@ INSTALL = install
 FLEX    = flex
 BISON   = bison
 STRIP   = strip
+AWK     = awk
 
 LIB_DIR          = $(srctree)/tools/lib/api/
 TRACE_EVENT_DIR = $(srctree)/tools/lib/traceevent/
@@ -316,6 +317,7 @@ LIB_H += util/vdso.h
 LIB_H += util/tsc.h
 LIB_H += util/itrace.h
 LIB_H += util/intel-pt-decoder/intel-pt-pkt-decoder.h
+LIB_H += util/intel-pt-decoder/intel-pt-insn-decoder.h
 LIB_H += ui/helpline.h
 LIB_H += ui/progress.h
 LIB_H += ui/util.h
@@ -403,6 +405,7 @@ LIB_OBJS += $(OUTPUT)util/cloexec.o
 LIB_OBJS += $(OUTPUT)util/thread-stack.o
 LIB_OBJS += $(OUTPUT)util/itrace.o
 LIB_OBJS += $(OUTPUT)util/intel-pt-decoder/intel-pt-pkt-decoder.o
+LIB_OBJS += $(OUTPUT)util/intel-pt-decoder/intel-pt-insn-decoder.o
 
 LIB_OBJS += $(OUTPUT)ui/setup.o
 LIB_OBJS += $(OUTPUT)ui/helpline.o
@@ -714,6 +717,18 @@ $(OUTPUT)tests/dwarf-unwind.o: tests/dwarf-unwind.c
 $(OUTPUT)util/config.o: util/config.c $(OUTPUT)PERF-CFLAGS
 	$(QUIET_CC)$(CC) -o $@ -c $(CFLAGS) -DETC_PERFCONFIG='"$(ETC_PERFCONFIG_SQ)"' $<
 
+inat_tables_script = ../../arch/x86/tools/gen-insn-attr-x86.awk
+inat_tables_maps = ../../arch/x86/lib/x86-opcode-map.txt
+
+$(OUTPUT)util/intel-pt-decoder/inat-tables.c: $(inat_tables_script) $(inat_tables_maps)
+	$(QUIET_GEN)$(AWK) -f $(inat_tables_script) $(inat_tables_maps) > $@ || rm -f $@
+
+$(OUTPUT)util/intel-pt-decoder/inat.c:
+	$(QUIET_GEN)cp ../../arch/x86/lib/inat.c $(OUTPUT)util/intel-pt-decoder/inat.c
+
+$(OUTPUT)util/intel-pt-decoder/intel-pt-insn-decoder.o: util/intel-pt-decoder/intel-pt-insn-decoder.c ../../arch/x86/include/asm/insn.h ../../arch/x86/lib/insn.c $(OUTPUT)util/intel-pt-decoder/inat.c $(OUTPUT)util/intel-pt-decoder/inat-tables.c $(OUTPUT)PERF-CFLAGS
+	$(QUIET_CC)$(CC) -o $@ -c $(CFLAGS) -I../../arch/x86/include -I$(OUTPUT)util/intel-pt-decoder -I../../arch/x86/lib $<
+
 $(OUTPUT)ui/setup.o: ui/setup.c $(OUTPUT)PERF-CFLAGS
 	$(QUIET_CC)$(CC) -o $@ -c $(CFLAGS) -DLIBDIR='"$(libdir_SQ)"' $<
 
@@ -971,7 +986,8 @@ config-clean:
 clean: $(LIBTRACEEVENT)-clean $(LIBAPIKFS)-clean config-clean
 	$(call QUIET_CLEAN, core-objs)  $(RM) $(LIB_OBJS) $(BUILTIN_OBJS) $(LIB_FILE) $(OUTPUT)perf-archive $(OUTPUT)perf-with-kcore $(OUTPUT)perf.o $(LANG_BINDINGS) $(GTK_OBJS)
 	$(call QUIET_CLEAN, core-progs) $(RM) $(ALL_PROGRAMS) perf perf-read-vdso32 perf-read-vdsox32
-	$(call QUIET_CLEAN, core-gen)   $(RM)  *.spec *.pyc *.pyo */*.pyc */*.pyo $(OUTPUT)common-cmds.h TAGS tags cscope* $(OUTPUT)PERF-VERSION-FILE $(OUTPUT)PERF-CFLAGS $(OUTPUT)PERF-FEATURES $(OUTPUT)util/*-bison* $(OUTPUT)util/*-flex*
+	$(call QUIET_CLEAN, core-gen)   $(RM)  *.spec *.pyc *.pyo */*.pyc */*.pyo $(OUTPUT)common-cmds.h TAGS tags cscope* $(OUTPUT)PERF-VERSION-FILE $(OUTPUT)PERF-CFLAGS $(OUTPUT)PERF-FEATURES $(OUTPUT)util/*-bison* $(OUTPUT)util/*-flex* \
+		$(OUTPUT)util/intel-pt-decoder/inat.c $(OUTPUT)util/intel-pt-decoder/inat-tables.c
 	$(QUIET_SUBDIR0)Documentation $(QUIET_SUBDIR1) clean
 	$(python-clean)
 

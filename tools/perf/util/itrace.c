@@ -44,6 +44,8 @@
 #include "debug.h"
 #include "parse-options.h"
 
+#include "intel-pt.h"
+
 int itrace_mmap__mmap(struct itrace_mmap *mm, struct itrace_mmap_params *mp,
 		      void *userpg, int fd)
 {
@@ -1017,9 +1019,9 @@ static bool itrace__dont_decode(struct perf_session *session)
 	       session->itrace_synth_opts->dont_decode;
 }
 
-int perf_event__process_itrace_info(struct perf_tool *tool __maybe_unused,
+int perf_event__process_itrace_info(struct perf_tool *tool,
 				    union perf_event *event,
-				    struct perf_session *session __maybe_unused)
+				    struct perf_session *session)
 {
 	enum itrace_type type = event->itrace_info.type;
 
@@ -1028,6 +1030,7 @@ int perf_event__process_itrace_info(struct perf_tool *tool __maybe_unused,
 
 	switch (type) {
 	case PERF_ITRACE_INTEL_PT:
+		return intel_pt_process_itrace_info(tool, event, session);
 	case PERF_ITRACE_UNKNOWN:
 	default:
 		return -EINVAL;

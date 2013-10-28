@@ -318,6 +318,7 @@ LIB_H += util/tsc.h
 LIB_H += util/itrace.h
 LIB_H += util/intel-pt-decoder/intel-pt-pkt-decoder.h
 LIB_H += util/intel-pt-decoder/intel-pt-insn-decoder.h
+LIB_H += util/intel-pt-decoder/intel-pt-log.h
 LIB_H += ui/helpline.h
 LIB_H += ui/progress.h
 LIB_H += ui/util.h
@@ -406,6 +407,7 @@ LIB_OBJS += $(OUTPUT)util/thread-stack.o
 LIB_OBJS += $(OUTPUT)util/itrace.o
 LIB_OBJS += $(OUTPUT)util/intel-pt-decoder/intel-pt-pkt-decoder.o
 LIB_OBJS += $(OUTPUT)util/intel-pt-decoder/intel-pt-insn-decoder.o
+LIB_OBJS += $(OUTPUT)util/intel-pt-decoder/intel-pt-log.o
 
 LIB_OBJS += $(OUTPUT)ui/setup.o
 LIB_OBJS += $(OUTPUT)ui/helpline.o

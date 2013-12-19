@@ -13,12 +13,72 @@
  *
  */
 
+#include <stdbool.h>
+
 #include "../../util/header.h"
+#include "../../util/debug.h"
+#include "../../util/pmu.h"
 #include "../../util/itrace.h"
 #include "../../util/intel-pt.h"
+#include "../../util/intel-bts.h"
+#include "../../util/evlist.h"
 
-struct itrace_record *itrace_record__init(struct perf_evlist *evlist __maybe_unused,
-					  const char *name __maybe_unused, int *err)
+static
+struct itrace_record *itrace_record__init_intel(struct perf_evlist *evlist,
+						const char *name,
+						int *err)
+{
+	struct perf_pmu *intel_pt_pmu;
+	struct perf_pmu *intel_bts_pmu;
+	struct perf_evsel *evsel;
+	bool found_pt = false;
+	bool found_bts = false;
+
+	intel_pt_pmu = perf_pmu__find(INTEL_PT_PMU_NAME);
+	intel_bts_pmu = perf_pmu__find(INTEL_BTS_PMU_NAME);
+
+	if (name) {
+		if (!strcmp(name, "")) {
+			found_pt = !!intel_pt_pmu;
+			if (!found_pt)
+				found_bts = !!intel_bts_pmu;
+		} else if (!strcmp(name, INTEL_PT_PMU_NAME)) {
+			found_pt = !!intel_pt_pmu;
+		} else if (!strcmp(name, INTEL_BTS_PMU_NAME)) {
+			found_bts = !!intel_bts_pmu;
+		} else {
+			return NULL;
+		}
+	}
+
+	if (evlist) {
+		evlist__for_each(evlist, evsel) {
+			if (intel_pt_pmu &&
+			    evsel->attr.type == intel_pt_pmu->type)
+				found_pt = true;
+			if (intel_bts_pmu &&
+			    evsel->attr.type == intel_bts_pmu->type)
+				found_bts = true;
+		}
+	}
+
+	if (found_pt && found_bts) {
+		pr_err("intel_pt and intel_bts may not be used together\n");
+		*err = -EINVAL;
+		return NULL;
+	}
+
+	if (found_pt)
+		return intel_pt_recording_init(err);
+
+	if (found_bts)
+		return intel_bts_recording_init(err);
+
+	return NULL;
+}
+
+struct itrace_record *itrace_record__init(struct perf_evlist *evlist,
+					  const char *name, int *err)
 {
 	char buffer[64];
 	int ret;
@@ -32,7 +92,7 @@ struct itrace_record *itrace_record__init(struct perf_evlist *evlist __maybe_unu
 	}
 
 	if (!strncmp(buffer, "GenuineIntel,", 13))
-		return intel_pt_recording_init(err);
+		return itrace_record__init_intel(evlist, name, err);
 
 	return NULL;
 }

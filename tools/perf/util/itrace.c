@@ -45,6 +45,7 @@
 #include "parse-options.h"
 
 #include "intel-pt.h"
+#include "intel-bts.h"
 
 int itrace_mmap__mmap(struct itrace_mmap *mm, struct itrace_mmap_params *mp,
 		      void *userpg, int fd)
@@ -1031,6 +1032,8 @@ int perf_event__process_itrace_info(struct perf_tool *tool,
 	switch (type) {
 	case PERF_ITRACE_INTEL_PT:
 		return intel_pt_process_itrace_info(tool, event, session);
+	case PERF_ITRACE_INTEL_BTS:
+		return intel_bts_process_itrace_info(tool, event, session);
 	case PERF_ITRACE_UNKNOWN:
 	default:
 		return -EINVAL;

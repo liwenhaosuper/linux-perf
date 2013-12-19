@@ -1,0 +1,1365 @@
+/*
+ * intel-bts.c: Intel Processor Trace support
+ * Copyright (c) 2013-2014, Intel Corporation.
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms and conditions of the GNU General Public License,
+ * version 2, as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+ * more details.
+ *
+ */
+
+#include <endian.h>
+#include <byteswap.h>
+
+#include "cpumap.h"
+#include "color.h"
+#include "evsel.h"
+#include "evlist.h"
+#include "machine.h"
+#include "session.h"
+#include "util.h"
+#include "pmu.h"
+#include "debug.h"
+#include "tsc.h"
+#include "itrace.h"
+#include "intel-bts.h"
+
+#define MAX_TIMESTAMP (~0ULL)
+
+#define KiB(x) ((x) * 1024)
+#define MiB(x) ((x) * 1024 * 1024)
+#define KiB_MASK(x) (KiB(x) - 1)
+#define MiB_MASK(x) (MiB(x) - 1)
+
+#define INTEL_BTS_DFLT_SAMPLE_SIZE	KiB(4)
+
+#define INTEL_BTS_MAX_SAMPLE_SIZE	KiB(60)
+
+#if __BYTE_ORDER == __BIG_ENDIAN
+#define le64_to_cpu bswap_64
+#else
+#define le64_to_cpu
+#endif
+
+struct intel_bts_snapshot_ref {
+	void	*ref_buf;
+	size_t	ref_offset;
+	bool	wrapped;
+};
+
+struct intel_bts_recording {
+	struct itrace_record		itr;
+	struct perf_pmu			*intel_bts_pmu;
+	struct perf_evlist		*evlist;
+	bool				snapshot_mode;
+	size_t				snapshot_size;
+	int				snapshot_ref_cnt;
+	struct intel_bts_snapshot_ref	*snapshot_refs;
+};
+
+struct intel_bts {
+	struct itrace			itrace;
+	struct itrace_queues		queues;
+	struct itrace_heap		heap;
+	u32				itrace_type;
+	struct perf_session		*session;
+	struct machine			*machine;
+	bool				sampling_mode;
+	bool				snapshot_mode;
+	bool				data_queued;
+	u32				pmu_type;
+	struct perf_tsc_conversion	tc;
+	bool				cap_user_time_zero;
+	struct itrace_synth_opts	synth_opts;
+	bool				sample_branches;
+	u64				branches_sample_type;
+	u64				branches_id;
+	size_t				branches_event_size;
+	bool				synth_needs_swap;
+};
+
+struct intel_bts_queue {
+	struct intel_bts	*bts;
+	unsigned int		queue_nr;
+	struct itrace_buffer	*buffer;
+	bool			on_heap;
+	bool			done;
+	pid_t			pid;
+	pid_t			tid;
+	int			cpu;
+	u64			time;
+};
+
+struct branch {
+	u64 from;
+	u64 to;
+	u64 misc;
+};
+
+static void intel_bts_dump(struct intel_bts *bts __maybe_unused,
+			   unsigned char *buf, size_t len)
+{
+	struct branch *branch;
+	size_t i, pos = 0, br_sz = sizeof(struct branch), sz;
+	const char *color = PERF_COLOR_BLUE;
+
+	color_fprintf(stdout, color,
+		      ". ... Intel BTS data: size %zu bytes\n",
+		      len);
+
+	while (len) {
+		if (len >= br_sz)
+			sz = br_sz;
+		else
+			sz = len;
+		printf(".");
+		color_fprintf(stdout, color, "  %08x: ", pos);
+		for (i = 0; i < sz; i++)
+			color_fprintf(stdout, color, " %02x", buf[i]);
+		for (; i < br_sz; i++)
+			color_fprintf(stdout, color, "   ");
+		if (len >= br_sz) {
+			branch = (struct branch *)buf;
+			color_fprintf(stdout, color, " %"PRIx64" -> %"PRIx64" %s\n",
+				      le64_to_cpu(branch->from),
+				      le64_to_cpu(branch->to),
+				      le64_to_cpu(branch->misc) & 0x10 ?
+							"pred" : "miss");
+		} else {
+			color_fprintf(stdout, color, " Bad record!\n");
+		}
+		pos += sz;
+		buf += sz;
+		len -= sz;
+	}
+}
+
+static void intel_bts_dump_event(struct intel_bts *bts, unsigned char *buf,
+				 size_t len)
+{
+	printf(".\n");
+	intel_bts_dump(bts, buf, len);
+}
+
+static void intel_bts_dump_sample(struct perf_session *session,
+				  struct perf_sample *sample)
+{
+	struct intel_bts *bts = container_of(session->itrace, struct intel_bts,
+					     itrace);
+
+	intel_bts_dump(bts, sample->aux_sample.data,
+		       sample->aux_sample.size);
+	printf(".\n");
+}
+
+static int intel_bts_lost(struct intel_bts *bts, struct perf_sample *sample,
+			  struct perf_tool *tool)
+{
+	union perf_event event;
+	int err;
+
+	itrace_synth_error(&event.itrace_error, PERF_ITRACE_DECODER_ERROR,
+			   ENOSPC, sample->cpu, sample->pid, sample->tid, 0,
+			   "Lost trace data");
+
+	err = perf_session__deliver_synth_event(bts->session, &event, NULL,
+						tool);
+	if (err)
+		pr_err("Intel BTS: failed to deliver error event, error %d\n",
+		       err);
+
+	return err;
+}
+
+static struct intel_bts_queue *intel_bts_alloc_queue(struct intel_bts *bts,
+						     unsigned int queue_nr)
+{
+	struct intel_bts_queue *btsq;
+
+	btsq = zalloc(sizeof(struct intel_bts_queue));
+	if (!btsq)
+		return NULL;
+
+	btsq->bts = bts;
+	btsq->queue_nr = queue_nr;
+	btsq->pid = -1;
+	btsq->tid = -1;
+	btsq->cpu = -1;
+
+	return btsq;
+}
+
+static int intel_bts_setup_queue(struct intel_bts *bts,
+				 struct itrace_queue *queue,
+				 unsigned int queue_nr)
+{
+	struct intel_bts_queue *btsq = queue->priv;
+
+	if (list_empty(&queue->head))
+		return 0;
+
+	if (!btsq) {
+		btsq = intel_bts_alloc_queue(bts, queue_nr);
+		if (!btsq)
+			return -ENOMEM;
+		queue->priv = btsq;
+
+		if (queue->cpu != -1)
+			btsq->cpu = queue->cpu;
+		btsq->tid = queue->tid;
+	}
+
+	if (bts->sampling_mode)
+		return 0;
+
+	if (!btsq->on_heap && !btsq->buffer) {
+		int ret;
+
+		btsq->buffer = itrace_buffer__next(queue, NULL);
+		if (!btsq->buffer)
+			return 0;
+
+		ret = itrace_heap__add(&bts->heap, queue_nr,
+				       btsq->buffer->reference);
+		if (ret)
+			return ret;
+		btsq->on_heap = true;
+	}
+
+	return 0;
+}
+
+static int intel_bts_setup_queues(struct intel_bts *bts)
+{
+	unsigned int i;
+	int ret;
+
+	for (i = 0; i < bts->queues.nr_queues; i++) {
+		ret = intel_bts_setup_queue(bts, &bts->queues.queue_array[i],
+					    i);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+static inline int intel_bts_update_queues(struct intel_bts *bts)
+{
+	if (bts->queues.new_data) {
+		bts->queues.new_data = false;
+		return intel_bts_setup_queues(bts);
+	}
+	return 0;
+}
+
+static unsigned char *intel_bts_find_overlap(unsigned char *buf_a, size_t len_a,
+					     unsigned char *buf_b, size_t len_b)
+{
+	size_t offs, len;
+
+	if (len_a > len_b)
+		offs = len_a - len_b;
+	else
+		offs = 0;
+
+	for (; offs < len_a; offs += sizeof(struct branch)) {
+		len = len_a - offs;
+		if (!memcmp(buf_a + offs, buf_b, len))
+			return buf_b + len;
+	}
+
+	return buf_b;
+}
+
+static int intel_bts_do_fix_overlap(struct itrace_queue *queue,
+				    struct itrace_buffer *b)
+{
+	struct itrace_buffer *a;
+	void *start;
+
+	if (b->list.prev == &queue->head)
+		return 0;
+	a = list_entry(b->list.prev, struct itrace_buffer, list);
+	start = intel_bts_find_overlap(a->data, a->size, b->data, b->size);
+	if (!start)
+		return -EINVAL;
+	b->use_size = b->data + b->size - start;
+	b->use_data = start;
+	return 0;
+}
+
+static int intel_bts_synth_branch_sample(struct intel_bts_queue *btsq,
+					 struct branch *branch,
+					 struct perf_tool *tool)
+{
+	int ret;
+	struct intel_bts *bts = btsq->bts;
+	union perf_event event;
+	struct perf_sample sample = {0};
+
+	event.sample.header.type = PERF_RECORD_SAMPLE;
+	event.sample.header.misc = PERF_RECORD_MISC_USER;
+	event.sample.header.size = sizeof(struct perf_event_header);
+
+	sample.ip = le64_to_cpu(branch->from);
+	sample.pid = btsq->pid;
+	sample.tid = btsq->tid;
+	sample.addr = le64_to_cpu(branch->to);
+	sample.id = btsq->bts->branches_id;
+	sample.stream_id = btsq->bts->branches_id;
+	sample.period = 1;
+	sample.cpu = btsq->cpu;
+
+	if (bts->synth_opts.inject) {
+		event.sample.header.size = bts->branches_event_size;
+		ret = perf_event__synthesize_sample(&event,
+						    bts->branches_sample_type,
+						    0, &sample,
+						    bts->synth_needs_swap);
+		if (ret)
+			return ret;
+	}
+
+	ret = perf_session__deliver_synth_event(bts->session, &event, &sample,
+						tool);
+	if (ret)
+		pr_err("Intel BTS: failed to deliver branch event, error %d\n",
+		       ret);
+
+	return ret;
+}
+
+static int intel_bts_process_buffer(struct intel_bts_queue *btsq,
+				    struct itrace_buffer *buffer,
+				    struct perf_tool *tool)
+{
+	struct branch *branch;
+	size_t sz;
+	int err = 0;
+
+	if (buffer->use_data) {
+		sz = buffer->use_size;
+		branch = buffer->use_data;
+	} else {
+		sz = buffer->size;
+		branch = buffer->data;
+	}
+
+	if (!btsq->bts->sample_branches)
+		return 0;
+
+	while (sz > sizeof(struct branch)) {
+		if (!branch->from && !branch->to)
+			continue;
+		err = intel_bts_synth_branch_sample(btsq, branch, tool);
+		if (err)
+			break;
+		branch += 1;
+		sz -= sizeof(struct branch);
+	}
+	return err;
+}
+
+static int intel_bts_process_queue(struct intel_bts_queue *btsq, u64 *timestamp,
+				   struct perf_tool *tool)
+{
+	struct itrace_buffer *buffer = btsq->buffer;
+	struct itrace_queue *queue;
+	int err;
+
+	if (btsq->done)
+		return 1;
+
+	if (btsq->pid == -1) {
+		struct thread *thread;
+
+		thread = machine__find_thread(btsq->bts->machine, -1, btsq->tid);
+		if (thread)
+			btsq->pid = thread->pid_;
+	}
+
+	queue = &btsq->bts->queues.queue_array[btsq->queue_nr];
+
+	if (!buffer)
+		buffer = itrace_buffer__next(queue, NULL);
+
+	if (!buffer) {
+		if (!btsq->bts->sampling_mode)
+			btsq->done = 1;
+		return 1;
+	}
+
+	/* Currently there is no support for split buffers */
+	if (buffer->consecutive)
+		return -EINVAL;
+
+	if (!buffer->data) {
+		int fd = perf_data_file__fd(btsq->bts->session->file);
+
+		buffer->data = itrace_buffer__get_data(buffer, fd);
+		if (!buffer->data)
+			return -ENOMEM;
+	}
+
+	if (btsq->bts->snapshot_mode && !buffer->consecutive &&
+	    intel_bts_do_fix_overlap(queue, buffer))
+		return -ENOMEM;
+
+	err = intel_bts_process_buffer(btsq, buffer, tool);
+
+	itrace_buffer__drop_data(buffer);
+
+	btsq->buffer = itrace_buffer__next(queue, buffer);
+	if (btsq->buffer) {
+		if (timestamp)
+			*timestamp = btsq->buffer->reference;
+	} else {
+		if (!btsq->bts->sampling_mode)
+			btsq->done = 1;
+	}
+
+	return err;
+}
+
+static int intel_bts_flush_queue(struct intel_bts_queue *btsq,
+				 struct perf_tool *tool)
+{
+	u64 ts = 0;
+	int ret;
+
+	while (1) {
+		ret = intel_bts_process_queue(btsq, &ts, tool);
+		if (ret < 0)
+			return ret;
+		if (ret)
+			break;
+	}
+	return 0;
+}
+
+static int intel_bts_process_sample(struct intel_bts *bts,
+				    struct perf_sample *sample,
+				    struct perf_tool *tool)
+{
+	struct itrace_queue *queue = itrace_queues__sample_queue(&bts->queues,
+								 sample,
+								 bts->session);
+	struct intel_bts_queue *btsq = queue->priv;
+	u64 ts = 0;
+	int ret;
+
+	ret = intel_bts_process_queue(btsq, &ts, tool);
+	if (ret < 0)
+		return ret;
+	return 0;
+}
+
+static int intel_bts_process_tid_exit(struct intel_bts *bts, pid_t tid,
+				      struct perf_tool *tool)
+{
+	struct itrace_queues *queues = &bts->queues;
+	unsigned int i;
+
+	for (i = 0; i < queues->nr_queues; i++) {
+		struct itrace_queue *queue = &bts->queues.queue_array[i];
+		struct intel_bts_queue *btsq = queue->priv;
+
+		if (btsq && btsq->tid == tid)
+			return intel_bts_flush_queue(btsq, tool);
+	}
+	return 0;
+}
+
+static int intel_bts_process_queues(struct intel_bts *bts, u64 timestamp,
+				    struct perf_tool *tool)
+{
+	while (1) {
+		unsigned int queue_nr;
+		struct itrace_queue *queue;
+		struct intel_bts_queue *btsq;
+		u64 ts = 0;
+		int ret;
+
+		if (!bts->heap.heap_cnt)
+			return 0;
+
+		if (bts->heap.heap_array[0].ordinal > timestamp)
+			return 0;
+
+		queue_nr = bts->heap.heap_array[0].queue_nr;
+		queue = &bts->queues.queue_array[queue_nr];
+		btsq = queue->priv;
+
+		itrace_heap__pop(&bts->heap);
+
+		ret = intel_bts_process_queue(btsq, &ts, tool);
+		if (ret < 0) {
+			itrace_heap__add(&bts->heap, queue_nr, ts);
+			return ret;
+		}
+
+		if (!ret) {
+			ret = itrace_heap__add(&bts->heap, queue_nr, ts);
+			if (ret < 0)
+				return ret;
+		} else {
+			btsq->on_heap = false;
+		}
+	}
+
+	return 0;
+}
+
+static int intel_bts_process_event(struct perf_session *session,
+				   union perf_event *event,
+				   struct perf_sample *sample,
+				   struct perf_tool *tool)
+{
+	struct intel_bts *bts = container_of(session->itrace, struct intel_bts,
+					     itrace);
+	u64 timestamp;
+	int err;
+
+	if (dump_trace)
+		return 0;
+
+	if (!tool->ordered_events) {
+		pr_err("Intel BTS requires ordered events\n");
+		return -EINVAL;
+	}
+
+	if (sample->time)
+		timestamp = perf_time_to_tsc(sample->time, &bts->tc);
+	else
+		timestamp = 0;
+
+	err = intel_bts_update_queues(bts);
+	if (err)
+		return err;
+
+	if (bts->sampling_mode) {
+		if (sample->aux_sample.size)
+			err = intel_bts_process_sample(bts, sample, tool);
+	} else {
+		err = intel_bts_process_queues(bts, timestamp, tool);
+		if (err)
+			return err;
+		if (event->header.type == PERF_RECORD_EXIT)
+			err = intel_bts_process_tid_exit(bts, event->comm.tid,
+							 tool);
+	}
+	if (err)
+		return err;
+
+	if (event->header.type == PERF_RECORD_AUX &&
+	    (event->aux.flags & PERF_AUX_FLAG_TRUNCATED) &&
+	    bts->synth_opts.errors)
+		err = intel_bts_lost(bts, sample, tool);
+
+	return err;
+}
+
+static int intel_bts_fix_overlap(struct intel_bts *bts, unsigned int queue_nr)
+{
+	struct itrace_queue *queue = &bts->queues.queue_array[queue_nr];
+	struct itrace_buffer *b;
+
+	b = list_entry(queue->head.prev, struct itrace_buffer, list);
+	return intel_bts_do_fix_overlap(queue, b);
+}
+
+static int intel_bts_queue_event(struct perf_session *session,
+				 union perf_event *event __maybe_unused,
+				 struct perf_sample *sample)
+{
+	struct intel_bts *bts = container_of(session->itrace, struct intel_bts,
+					     itrace);
+	unsigned int queue_nr;
+	u64 timestamp;
+	int err;
+
+	if (!sample->aux_sample.size)
+		return 0;
+
+	if (!bts->sampling_mode)
+		return 0;
+
+	if (sample->time)
+		timestamp = perf_time_to_tsc(sample->time, &bts->tc);
+	else
+		timestamp = 0;
+
+	err = itrace_queues__add_sample(&bts->queues, sample, session,
+					&queue_nr, timestamp);
+	if (err)
+		return err;
+
+	return intel_bts_fix_overlap(bts, queue_nr);
+}
+
+static int intel_bts_process_itrace_event(struct perf_session *session,
+					  union perf_event *event,
+					  struct perf_tool *tool __maybe_unused)
+{
+	struct intel_bts *bts = container_of(session->itrace, struct intel_bts,
+					     itrace);
+
+	if (bts->sampling_mode)
+		return 0;
+
+	if (!bts->data_queued) {
+		struct itrace_buffer *buffer;
+		off_t data_offset;
+		int fd = perf_data_file__fd(session->file);
+		int err;
+
+		if (perf_data_file__is_pipe(session->file)) {
+			data_offset = 0;
+		} else {
+			data_offset = lseek(fd, 0, SEEK_CUR);
+			if (data_offset == -1)
+				return -errno;
+		}
+
+		err = itrace_queues__add_event(&bts->queues, session, event,
+					       data_offset, &buffer);
+		if (err)
+			return err;
+
+		/* Dump here now we have copied a piped trace out of the pipe */
+		if (dump_trace) {
+			if (itrace_buffer__get_data(buffer, fd)) {
+				intel_bts_dump_event(bts, buffer->data,
+						     buffer->size);
+				itrace_buffer__put_data(buffer);
+			}
+		}
+	}
+
+	return 0;
+}
+
+static int intel_bts_flush(struct perf_session *session __maybe_unused,
+			   struct perf_tool *tool __maybe_unused)
+{
+	struct intel_bts *bts = container_of(session->itrace, struct intel_bts,
+					     itrace);
+	int ret;
+
+	if (dump_trace || bts->sampling_mode)
+		return 0;
+
+	if (!tool->ordered_events)
+		return -EINVAL;
+
+	ret = intel_bts_update_queues(bts);
+	if (ret < 0)
+		return ret;
+
+	return intel_bts_process_queues(bts, MAX_TIMESTAMP, tool);
+}
+
+static void intel_bts_free_queue(void *priv)
+{
+	struct intel_bts_queue *btsq = priv;
+
+	if (!btsq)
+		return;
+	free(btsq);
+}
+
+static void intel_bts_free_events(struct perf_session *session)
+{
+	struct intel_bts *bts = container_of(session->itrace, struct intel_bts,
+					     itrace);
+	struct itrace_queues *queues = &bts->queues;
+	unsigned int i;
+
+	for (i = 0; i < queues->nr_queues; i++) {
+		intel_bts_free_queue(queues->queue_array[i].priv);
+		queues->queue_array[i].priv = NULL;
+	}
+	itrace_queues__free(queues);
+}
+
+static void intel_bts_free(struct perf_session *session)
+{
+	struct intel_bts *bts = container_of(session->itrace, struct intel_bts,
+					     itrace);
+
+	itrace_heap__free(&bts->heap);
+	intel_bts_free_events(session);
+	session->itrace = NULL;
+	free(bts);
+}
+
+static bool intel_bts_sampling_mode(struct intel_bts *bts)
+{
+	struct perf_session *session = bts->session;
+	struct perf_evlist *evlist = session->evlist;
+	struct perf_evsel *evsel;
+
+	list_for_each_entry(evsel, &evlist->entries, node) {
+		if (evsel->attr.type == bts->pmu_type)
+			return false;
+		if (evsel->attr.sample_type & PERF_SAMPLE_AUX)
+			return true;
+	}
+	return false;
+}
+
+struct intel_bts_synth {
+	struct perf_tool dummy_tool;
+	struct perf_tool *tool;
+	struct perf_session *session;
+};
+
+static int intel_bts_event_synth(struct perf_tool *tool,
+				 union perf_event *event,
+				 struct perf_sample *sample __maybe_unused,
+				 struct machine *machine __maybe_unused)
+{
+	struct intel_bts_synth *intel_bts_synth =
+			container_of(tool, struct intel_bts_synth, dummy_tool);
+
+	return perf_session__deliver_synth_event(intel_bts_synth->session,
+						 event, NULL,
+						 intel_bts_synth->tool);
+}
+
+static int intel_bts_synth_event(struct perf_session *session,
+				 struct perf_tool *tool,
+				 struct perf_event_attr *attr, u64 id)
+{
+	struct intel_bts_synth intel_bts_synth;
+
+	memset(&intel_bts_synth, 0, sizeof(struct intel_bts_synth));
+	intel_bts_synth.tool = tool;
+	intel_bts_synth.session = session;
+
+	return perf_event__synthesize_attr(&intel_bts_synth.dummy_tool, attr, 1,
+					   &id, intel_bts_event_synth);
+}
+
+static int intel_bts_synth_events(struct intel_bts *bts,
+				  struct perf_session *session,
+				  struct perf_tool *tool)
+{
+	struct perf_evlist *evlist = session->evlist;
+	struct perf_evsel *evsel;
+	struct perf_event_attr attr;
+	bool found = false;
+	u64 id;
+	int err;
+
+	list_for_each_entry(evsel, &evlist->entries, node) {
+		if ((evsel->attr.type == bts->pmu_type ||
+		     (evsel->attr.sample_type & PERF_SAMPLE_AUX)) &&
+		    evsel->ids) {
+			found = true;
+			break;
+		}
+	}
+
+	if (!found) {
+		pr_debug("There are no selected events with Intel BTS data\n");
+		return 0;
+	}
+
+	memset(&attr, 0, sizeof(struct perf_event_attr));
+	attr.size = sizeof(struct perf_event_attr);
+	attr.type = PERF_TYPE_HARDWARE;
+	attr.sample_type = evsel->attr.sample_type & PERF_SAMPLE_MASK;
+	attr.sample_type |= PERF_SAMPLE_IP | PERF_SAMPLE_TID |
+			    PERF_SAMPLE_PERIOD;
+	attr.sample_type &= ~(u64)PERF_SAMPLE_TIME;
+	attr.sample_type &= ~(u64)PERF_SAMPLE_CPU;
+	attr.exclude_user = evsel->attr.exclude_user;
+	attr.exclude_kernel = evsel->attr.exclude_kernel;
+	attr.exclude_hv = evsel->attr.exclude_hv;
+	attr.exclude_host = evsel->attr.exclude_host;
+	attr.exclude_guest = evsel->attr.exclude_guest;
+	attr.sample_id_all = evsel->attr.sample_id_all;
+	attr.read_format = evsel->attr.read_format;
+
+	id = evsel->id[0] + 1000000000;
+	if (!id)
+		id = 1;
+
+	if (bts->synth_opts.branches) {
+		attr.config = PERF_COUNT_HW_BRANCH_INSTRUCTIONS;
+		attr.sample_period = 1;
+		attr.sample_type |= PERF_SAMPLE_ADDR;
+		pr_debug("Synthesizing 'branches' event with id %" PRIu64 " sample type %#" PRIx64 "\n",
+			 id, (u64)attr.sample_type);
+		err = intel_bts_synth_event(session, tool, &attr, id);
+		if (err) {
+			pr_err("%s: failed to synthesize 'branches' event type\n",
+			       __func__);
+			return err;
+		}
+		bts->sample_branches = true;
+		bts->branches_sample_type = attr.sample_type;
+		bts->branches_id = id;
+		/*
+		 * We only use sample types from PERF_SAMPLE_MASK so we can use
+		 * __perf_evsel__sample_size() here.
+		 */
+		bts->branches_event_size = sizeof(struct sample_event) +
+				__perf_evsel__sample_size(attr.sample_type);
+	}
+
+	bts->synth_needs_swap = evsel->needs_swap;
+
+	return 0;
+}
+
+enum {
+	INTEL_BTS_PMU_TYPE,
+	INTEL_BTS_TIME_SHIFT,
+	INTEL_BTS_TIME_MULT,
+	INTEL_BTS_TIME_ZERO,
+	INTEL_BTS_CAP_USER_TIME_ZERO,
+	INTEL_BTS_SNAPSHOT_MODE,
+	INTEL_BTS_ITRACE_PRIV_SIZE,
+};
+
+static const char * const intel_bts_info_fmts[] = {
+	[INTEL_BTS_PMU_TYPE]		= "  PMU Type           %"PRId64"\n",
+	[INTEL_BTS_TIME_SHIFT]		= "  Time Shift         %"PRIu64"\n",
+	[INTEL_BTS_TIME_MULT]		= "  Time Muliplier     %"PRIu64"\n",
+	[INTEL_BTS_TIME_ZERO]		= "  Time Zero          %"PRIu64"\n",
+	[INTEL_BTS_CAP_USER_TIME_ZERO]	= "  Cap Time Zero      %"PRId64"\n",
+	[INTEL_BTS_SNAPSHOT_MODE]	= "  Snapshot mode      %"PRId64"\n",
+};
+
+static void intel_bts_print_info(u64 *arr, int start, int finish)
+{
+	int i;
+
+	if (!dump_trace)
+		return;
+
+	for (i = start; i <= finish; i++)
+		fprintf(stdout, intel_bts_info_fmts[i], arr[i]);
+}
+
+u64 intel_bts_itrace_info_priv[INTEL_BTS_ITRACE_PRIV_SIZE];
+
+int intel_bts_process_itrace_info(struct perf_tool *tool,
+				  union perf_event *event,
+				  struct perf_session *session)
+{
+	struct itrace_info_event *itrace_info = &event->itrace_info;
+	size_t min_sz = sizeof(u64) * INTEL_BTS_SNAPSHOT_MODE;
+	struct intel_bts *bts;
+	int err;
+
+	if (itrace_info->header.size < sizeof(struct itrace_info_event) +
+					min_sz)
+		return -EINVAL;
+
+	bts = zalloc(sizeof(struct intel_bts));
+	if (!bts)
+		return -ENOMEM;
+
+	err = itrace_queues__init(&bts->queues);
+	if (err)
+		goto err_free;
+
+	bts->session = session;
+	bts->machine = &session->machines.host; /* No kvm support */
+	bts->itrace_type = itrace_info->type;
+	bts->pmu_type = itrace_info->priv[INTEL_BTS_PMU_TYPE];
+	bts->tc.time_shift = itrace_info->priv[INTEL_BTS_TIME_SHIFT];
+	bts->tc.time_mult = itrace_info->priv[INTEL_BTS_TIME_MULT];
+	bts->tc.time_zero = itrace_info->priv[INTEL_BTS_TIME_ZERO];
+	bts->cap_user_time_zero =
+			itrace_info->priv[INTEL_BTS_CAP_USER_TIME_ZERO];
+	bts->snapshot_mode = itrace_info->priv[INTEL_BTS_SNAPSHOT_MODE];
+
+	bts->sampling_mode = intel_bts_sampling_mode(bts);
+
+	bts->itrace.process_event = intel_bts_process_event;
+	bts->itrace.queue_event = intel_bts_queue_event;
+	bts->itrace.process_itrace_event = intel_bts_process_itrace_event;
+	bts->itrace.dump_itrace_sample = intel_bts_dump_sample;
+	bts->itrace.flush_events = intel_bts_flush;
+	bts->itrace.free_events = intel_bts_free_events;
+	bts->itrace.free = intel_bts_free;
+	session->itrace = &bts->itrace;
+
+	intel_bts_print_info(&itrace_info->priv[0], INTEL_BTS_PMU_TYPE,
+			     INTEL_BTS_SNAPSHOT_MODE);
+
+	if (dump_trace)
+		return 0;
+
+	if (session->itrace_synth_opts && session->itrace_synth_opts->set)
+		bts->synth_opts = *session->itrace_synth_opts;
+	else
+		itrace_synth_opts__set_default(&bts->synth_opts);
+
+	err = intel_bts_synth_events(bts, session, tool);
+	if (err)
+		goto err_free_queues;
+
+	err = itrace_queues__process_index(&bts->queues, session);
+	if (err)
+		goto err_free_queues;
+
+	if (bts->queues.populated)
+		bts->data_queued = true;
+
+	return 0;
+
+err_free_queues:
+	itrace_queues__free(&bts->queues);
+	session->itrace = NULL;
+err_free:
+	free(bts);
+	return err;
+}
+
+static size_t intel_bts_info_priv_size(struct itrace_record *itr __maybe_unused)
+{
+	return sizeof(intel_bts_itrace_info_priv);
+}
+
+static int intel_bts_info_fill(struct itrace_record *itr,
+			       struct perf_session *session,
+			       struct itrace_info_event *itrace_info,
+			       size_t priv_size)
+{
+	struct intel_bts_recording *btsr =
+			container_of(itr, struct intel_bts_recording, itr);
+	struct perf_pmu *intel_bts_pmu = btsr->intel_bts_pmu;
+	struct perf_event_mmap_page *pc;
+	struct perf_tsc_conversion tc = {0};
+	bool cap_user_time_zero = false;
+	int err;
+
+	if (priv_size != sizeof(intel_bts_itrace_info_priv))
+		return -EINVAL;
+
+	if (!session->evlist->nr_mmaps)
+		return -EINVAL;
+
+	pc = session->evlist->mmap[0].base;
+	if (pc) {
+		err = perf_read_tsc_conversion(pc, &tc);
+		if (err) {
+			if (err != -EOPNOTSUPP)
+				return err;
+		} else {
+			cap_user_time_zero = tc.time_mult != 0;
+		}
+		if (!cap_user_time_zero)
+			ui__warning("Intel BTS: TSC not available\n");
+	}
+
+	itrace_info->type = PERF_ITRACE_INTEL_BTS;
+	itrace_info->priv[INTEL_BTS_PMU_TYPE] = intel_bts_pmu->type;
+	itrace_info->priv[INTEL_BTS_TIME_SHIFT] = tc.time_shift;
+	itrace_info->priv[INTEL_BTS_TIME_MULT] = tc.time_mult;
+	itrace_info->priv[INTEL_BTS_TIME_ZERO] = tc.time_zero;
+	itrace_info->priv[INTEL_BTS_CAP_USER_TIME_ZERO] = cap_user_time_zero;
+	itrace_info->priv[INTEL_BTS_SNAPSHOT_MODE] = btsr->snapshot_mode;
+
+	return 0;
+}
+
+static int intel_bts_recording_options(struct itrace_record *itr,
+				       struct perf_evlist *evlist,
+				       struct record_opts *opts)
+{
+	struct intel_bts_recording *btsr =
+			container_of(itr, struct intel_bts_recording, itr);
+	struct perf_pmu *intel_bts_pmu = btsr->intel_bts_pmu;
+	struct perf_evsel *evsel, *intel_bts_evsel = NULL;
+	const struct cpu_map *cpus = evlist->cpus;
+	bool privileged = geteuid() == 0 || perf_event_paranoid() < 0;
+
+	btsr->evlist = evlist;
+	btsr->snapshot_mode = opts->itrace_snapshot_mode;
+
+	list_for_each_entry(evsel, &evlist->entries, node) {
+		if (evsel->attr.type == intel_bts_pmu->type) {
+			if (intel_bts_evsel) {
+				pr_err("There may be only one " INTEL_BTS_PMU_NAME " event\n");
+				return -EINVAL;
+			}
+			evsel->attr.freq = 0;
+			evsel->attr.sample_period = 1;
+			intel_bts_evsel = evsel;
+			opts->full_itrace = true;
+		}
+	}
+
+	if (opts->itrace_snapshot_mode && !opts->full_itrace) {
+		pr_err("Snapshot mode (-S option) requires " INTEL_BTS_PMU_NAME " PMU event (-e " INTEL_BTS_PMU_NAME ")\n");
+		return -EINVAL;
+	}
+
+	if (!opts->full_itrace && !opts->sample_itrace)
+		return 0;
+
+	if (opts->full_itrace && !cpu_map__empty(cpus)) {
+		pr_err(INTEL_BTS_PMU_NAME " does not support per-cpu recording\n");
+		return -EINVAL;
+	}
+
+	if (opts->full_itrace && opts->sample_itrace) {
+		pr_err("Full trace (" INTEL_BTS_PMU_NAME " PMU) and sample trace (-I option) cannot be used together\n");
+		return -EINVAL;
+	}
+
+	/* Set default size for sample mode */
+	if (opts->sample_itrace) {
+		if (!opts->itrace_sample_size)
+			opts->itrace_sample_size = INTEL_BTS_DFLT_SAMPLE_SIZE;
+		pr_debug2("Intel BTS sample size: %zu\n",
+			  opts->itrace_sample_size);
+	}
+
+	/* Set default sizes for snapshot mode */
+	if (opts->itrace_snapshot_mode) {
+		if (!opts->itrace_snapshot_size && !opts->itrace_mmap_pages) {
+			if (privileged) {
+				opts->itrace_mmap_pages = MiB(4) / page_size;
+			} else {
+				opts->itrace_mmap_pages = KiB(128) / page_size;
+				if (opts->mmap_pages == UINT_MAX)
+					opts->mmap_pages = KiB(256) / page_size;
+			}
+		} else if (!opts->itrace_mmap_pages && !privileged &&
+			   opts->mmap_pages == UINT_MAX) {
+			opts->mmap_pages = KiB(256) / page_size;
+		}
+		if (!opts->itrace_snapshot_size)
+			opts->itrace_snapshot_size =
+				opts->itrace_mmap_pages * (size_t)page_size;
+		if (!opts->itrace_mmap_pages) {
+			size_t sz = opts->itrace_snapshot_size;
+
+			sz = round_up(sz, page_size) / page_size;
+			opts->itrace_mmap_pages = next_pow2_l(sz);
+		}
+		if (opts->itrace_snapshot_size >
+				opts->itrace_mmap_pages * (size_t)page_size) {
+			pr_err("Snapshot size %zu must not be greater than instruction tracing mmap size %zu\n",
+			       opts->itrace_snapshot_size,
+			       opts->itrace_mmap_pages * (size_t)page_size);
+			return -EINVAL;
+		}
+		if (!opts->itrace_snapshot_size || !opts->itrace_mmap_pages) {
+			pr_err("Failed to calculate default snapshot size and/or instruction tracing mmap pages\n");
+			return -EINVAL;
+		}
+		pr_debug2("Intel BTS snapshot size: %zu\n",
+			  opts->itrace_snapshot_size);
+	}
+
+	/* Set default sizes for full trace mode */
+	if (opts->full_itrace && !opts->itrace_mmap_pages) {
+		if (privileged) {
+			opts->itrace_mmap_pages = MiB(4) / page_size;
+		} else {
+			opts->itrace_mmap_pages = KiB(128) / page_size;
+			if (opts->mmap_pages == UINT_MAX)
+				opts->mmap_pages = KiB(256) / page_size;
+		}
+	}
+
+	/* Validate itrace_mmap_pages */
+	if (opts->itrace_mmap_pages) {
+		size_t sz = opts->itrace_mmap_pages * (size_t)page_size;
+		size_t min_sz;
+
+		if (opts->itrace_snapshot_mode)
+			min_sz = KiB(4);
+		else
+			min_sz = KiB(8);
+
+		if (sz < min_sz || !is_power_of_2(sz)) {
+			pr_err("Invalid mmap size for Intel BTS: must be at least %zuKiB and a power of 2\n",
+			       min_sz / 1024);
+			return -EINVAL;
+		}
+	}
+
+	if (intel_bts_evsel) {
+		/*
+		 * To obtain the itrace buffer file descriptor, the itrace event
+		 * must come first.
+		 */
+		perf_evlist__to_front(evlist, intel_bts_evsel);
+		/*
+		 * In the case of per-cpu mmaps, we need the CPU on the
+		 * AUX event.
+		 */
+		if (!cpu_map__empty(cpus))
+			perf_evsel__set_sample_bit(intel_bts_evsel, CPU);
+	}
+
+	/* Add dummy event to keep tracking */
+	if (opts->full_itrace) {
+		struct perf_evsel *tracking_evsel;
+		int err;
+
+		err = parse_events(evlist, "dummy:u");
+		if (err)
+			return err;
+
+		tracking_evsel = perf_evlist__last(evlist);
+
+		perf_evlist__set_tracking_event(evlist, tracking_evsel);
+
+		tracking_evsel->attr.freq = 0;
+		tracking_evsel->attr.sample_period = 1;
+	}
+
+	return 0;
+}
+
+static int intel_bts_parse_sample_options(struct itrace_record *itr,
+					  size_t sample_size,
+					  struct record_opts *opts,
+					  const char *str)
+{
+	struct intel_bts_recording *btsr =
+			container_of(itr, struct intel_bts_recording, itr);
+	struct perf_pmu *intel_bts_pmu = btsr->intel_bts_pmu;
+
+	opts->itrace_sample_size = sample_size;
+	if (opts->itrace_sample_size > INTEL_BTS_MAX_SAMPLE_SIZE) {
+		pr_err("Intel BTS: sample size too big\n");
+		return -1;
+	}
+
+	if (str && *str) {
+		pr_err("Intel BTS: unexpected sampling options\n");
+		return -1;
+	}
+
+	opts->itrace_sample_config = 0;
+	opts->itrace_sample_type = intel_bts_pmu->type;
+	opts->sample_itrace = true;
+
+	return 0;
+}
+
+static int intel_bts_parse_snapshot_options(struct itrace_record *itr,
+					    struct record_opts *opts,
+					    const char *str)
+{
+	struct intel_bts_recording *btsr =
+			container_of(itr, struct intel_bts_recording, itr);
+	unsigned long long snapshot_size = 0;
+	char *endptr;
+
+	if (str) {
+		snapshot_size = strtoull(str, &endptr, 0);
+		if (*endptr || snapshot_size > SIZE_MAX)
+			return -1;
+	}
+
+	opts->itrace_snapshot_mode = true;
+	opts->itrace_snapshot_size = snapshot_size;
+
+	btsr->snapshot_size = snapshot_size;
+
+	return 0;
+}
+
+static u64 intel_bts_reference(struct itrace_record *itr __maybe_unused)
+{
+	return rdtsc();
+}
+
+static int intel_bts_alloc_snapshot_refs(struct intel_bts_recording *btsr,
+					 int idx)
+{
+	const size_t sz = sizeof(struct intel_bts_snapshot_ref);
+	int cnt = btsr->snapshot_ref_cnt, new_cnt = cnt * 2;
+	struct intel_bts_snapshot_ref *refs;
+
+	if (!new_cnt)
+		new_cnt = 16;
+
+	while (new_cnt <= idx)
+		new_cnt *= 2;
+
+	refs = calloc(new_cnt, sz);
+	if (!refs)
+		return -ENOMEM;
+
+	memcpy(refs, btsr->snapshot_refs, cnt * sz);
+
+	btsr->snapshot_refs = refs;
+	btsr->snapshot_ref_cnt = new_cnt;
+
+	return 0;
+}
+
+static void intel_bts_free_snapshot_refs(struct intel_bts_recording *btsr)
+{
+	int i;
+
+	for (i = 0; i < btsr->snapshot_ref_cnt; i++)
+		free(btsr->snapshot_refs[i].ref_buf);
+	free(btsr->snapshot_refs);
+}
+
+static void intel_bts_recording_free(struct itrace_record *itr)
+{
+	struct intel_bts_recording *btsr =
+			container_of(itr, struct intel_bts_recording, itr);
+
+	intel_bts_free_snapshot_refs(btsr);
+	free(btsr);
+}
+
+static int intel_bts_snapshot_start(struct itrace_record *itr)
+{
+	struct intel_bts_recording *btsr =
+			container_of(itr, struct intel_bts_recording, itr);
+	struct perf_evsel *evsel;
+
+	list_for_each_entry(evsel, &btsr->evlist->entries, node) {
+		if (evsel->attr.type == btsr->intel_bts_pmu->type)
+			return perf_evlist__disable_event(btsr->evlist, evsel);
+	}
+	return -EINVAL;
+}
+
+static int intel_bts_snapshot_finish(struct itrace_record *itr)
+{
+	struct intel_bts_recording *btsr =
+			container_of(itr, struct intel_bts_recording, itr);
+	struct perf_evsel *evsel;
+
+	list_for_each_entry(evsel, &btsr->evlist->entries, node) {
+		if (evsel->attr.type == btsr->intel_bts_pmu->type)
+			return perf_evlist__enable_event(btsr->evlist, evsel);
+	}
+	return -EINVAL;
+}
+
+static bool intel_bts_first_wrap(u64 *data, size_t buf_size)
+{
+	int i, a, b;
+
+	b = buf_size >> 3;
+	a = b - 512;
+	if (a < 0)
+		a = 0;
+
+	for (i = a; i < b; i++) {
+		if (data[i])
+			return true;
+	}
+
+	return false;
+}
+
+static int intel_bts_find_snapshot(struct itrace_record *itr, int idx,
+				   struct itrace_mmap *mm, unsigned char *data,
+				   u64 *head, u64 *old)
+{
+	struct intel_bts_recording *btsr =
+			container_of(itr, struct intel_bts_recording, itr);
+	bool wrapped;
+	int err;
+
+	pr_debug3("%s: mmap index %d old head %zu new head %zu\n",
+		  __func__, idx, (size_t)*old, (size_t)*head);
+
+	if (idx >= btsr->snapshot_ref_cnt) {
+		err = intel_bts_alloc_snapshot_refs(btsr, idx);
+		if (err)
+			goto out_err;
+	}
+
+	wrapped = btsr->snapshot_refs[idx].wrapped;
+	if (!wrapped && intel_bts_first_wrap((u64 *)data, mm->len)) {
+		btsr->snapshot_refs[idx].wrapped = true;
+		wrapped = true;
+	}
+
+	/*
+	 * In full trace mode 'head' continually increases.  However in snapshot
+	 * mode 'head' is an offset within the buffer.  Here 'old' and 'head'
+	 * are adjusted to match the full trace case which expects that 'old' is
+	 * always less than 'head'.
+	 */
+	if (wrapped) {
+		*old = *head;
+		*head += mm->len;
+	} else {
+		if (mm->mask)
+			*old &= mm->mask;
+		else
+			*old %= mm->len;
+		if (*old > *head)
+			*head += mm->len;
+	}
+
+	pr_debug3("%s: wrap-around %sdetected, adjusted old head %zu adjusted new head %zu\n",
+		  __func__, wrapped ? "" : "not ", (size_t)*old, (size_t)*head);
+
+	return 0;
+
+out_err:
+	pr_err("%s: failed, error %d\n", __func__, err);
+	return err;
+}
+
+static int intel_bts_read_finish(struct itrace_record *itr, int idx)
+{
+	struct intel_bts_recording *btsr =
+			container_of(itr, struct intel_bts_recording, itr);
+	struct perf_evsel *evsel;
+
+	list_for_each_entry(evsel, &btsr->evlist->entries, node) {
+		if (evsel->attr.type == btsr->intel_bts_pmu->type)
+			return perf_evlist__enable_event_idx(btsr->evlist,
+							     evsel, idx);
+	}
+	return -EINVAL;
+}
+
+struct itrace_record *intel_bts_recording_init(int *err)
+{
+	struct perf_pmu *intel_bts_pmu = perf_pmu__find(INTEL_BTS_PMU_NAME);
+	struct intel_bts_recording *btsr;
+
+	if (!intel_bts_pmu)
+		return NULL;
+
+	btsr = zalloc(sizeof(struct intel_bts_recording));
+	if (!btsr) {
+		*err = -ENOMEM;
+		return NULL;
+	}
+
+	btsr->intel_bts_pmu = intel_bts_pmu;
+	btsr->itr.parse_sample_options = intel_bts_parse_sample_options;
+	btsr->itr.recording_options = intel_bts_recording_options;
+	btsr->itr.info_priv_size = intel_bts_info_priv_size;
+	btsr->itr.info_fill = intel_bts_info_fill;
+	btsr->itr.free = intel_bts_recording_free;
+	btsr->itr.snapshot_start = intel_bts_snapshot_start;
+	btsr->itr.snapshot_finish = intel_bts_snapshot_finish;
+	btsr->itr.find_snapshot = intel_bts_find_snapshot;
+	btsr->itr.parse_snapshot_options = intel_bts_parse_snapshot_options;
+	btsr->itr.reference = intel_bts_reference;
+	btsr->itr.read_finish = intel_bts_read_finish;
+	btsr->itr.alignment = sizeof(struct branch);
+	return &btsr->itr;
+}

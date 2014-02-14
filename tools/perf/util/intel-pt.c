@@ -951,6 +951,8 @@ static int intel_pt_synth_branch_sample(struct intel_pt_queue *ptq,
 	sample.stream_id = ptq->pt->branches_id;
 	sample.period = 1;
 	sample.cpu = ptq->cpu;
+	sample.flags = ptq->flags;
+	sample.insn_len = ptq->insn_len;
 
 	if (pt->branches_filter && !(pt->branches_filter & ptq->flags))
 		return 0;
@@ -995,6 +997,8 @@ static int intel_pt_synth_instruction_sample(struct intel_pt_queue *ptq,
 	sample.stream_id = ptq->pt->instructions_id;
 	sample.period = ptq->pt->instructions_sample_period;
 	sample.cpu = ptq->cpu;
+	sample.flags = ptq->flags;
+	sample.insn_len = ptq->insn_len;
 
 	if (pt->synth_opts.callchain) {
 		thread_stack__sample(ptq->thread, ptq->chain,

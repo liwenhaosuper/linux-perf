@@ -4692,46 +4692,85 @@ static void perf_aux_sampler_destroy(struct perf_event *event)
 	ring_buffer_put(rb); /* can be last */
 }
 
+static bool exclusive_event_match(struct perf_event *e1, struct perf_event *e2);
+
+static bool perf_aux_event_match(struct perf_event *e1, struct perf_event *e2)
+{
+	return has_aux(e1) && exclusive_event_match(e1, e2);
+}
+
 static int perf_aux_sampler_init(struct perf_event *event,
 				 struct task_struct *task,
 				 struct pmu *pmu)
 {
+	struct perf_event_context *ctx;
 	struct perf_event_attr attr;
-	struct perf_event *sampler;
+	struct perf_event *sampler = NULL;
 	struct ring_buffer *rb;
-	unsigned long nr_pages;
+	unsigned long nr_pages, flags;
 
 	if (!pmu || !(pmu->setup_aux))
 		return -ENOTSUPP;
 
-	memset(&attr, 0, sizeof(attr));
-	attr.type = pmu->type;
-	attr.config = event->attr.aux_sample_config;
-	attr.sample_type = 0;
-	attr.disabled = event->attr.disabled;
-	attr.enable_on_exec = event->attr.enable_on_exec;
-	attr.exclude_hv = event->attr.exclude_hv;
-	attr.exclude_idle = event->attr.exclude_idle;
-	attr.exclude_user = event->attr.exclude_user;
-	attr.exclude_kernel = event->attr.exclude_kernel;
-	attr.aux_sample_size = event->attr.aux_sample_size;
+	ctx = find_get_context(pmu, task, event->cpu);
+	if (ctx) {
+		raw_spin_lock_irqsave(&ctx->lock, flags);
+		list_for_each_entry(sampler, &ctx->event_list, event_entry) {
+			/*
+			 * event is not an aux event, but all the relevant
+			 * bits should match
+			 */
+			if (perf_aux_event_match(sampler, event) &&
+			    sampler->attr.type == event->attr.aux_sample_type &&
+			    sampler->attr.config == event->attr.aux_sample_config &&
+			    sampler->attr.exclude_hv == event->attr.exclude_hv &&
+			    sampler->attr.exclude_idle == event->attr.exclude_idle &&
+			    sampler->attr.exclude_user == event->attr.exclude_user &&
+			    sampler->attr.exclude_kernel == event->attr.exclude_kernel &&
+			    sampler->attr.aux_sample_size >= event->attr.aux_sample_size &&
+			    atomic_long_inc_not_zero(&sampler->refcount))
+				goto got_event;
+		}
 
-	sampler = perf_event_create_kernel_counter(&attr, event->cpu, task,
-						   NULL, NULL);
-	if (IS_ERR(sampler))
-		return PTR_ERR(sampler);
+		sampler = NULL;
 
-	nr_pages = 1ul << __get_order(event->attr.aux_sample_size);
+got_event:
+		--ctx->pin_count;
+		put_ctx(ctx);
+		raw_spin_unlock_irqrestore(&ctx->lock, flags);
+	}
 
-	rb = rb_alloc_kernel(sampler, 0, nr_pages);
-	if (!rb) {
-		perf_event_release_kernel(sampler);
-		return -ENOMEM;
+	if (!sampler) {
+		memset(&attr, 0, sizeof(attr));
+		attr.type = pmu->type;
+		attr.config = event->attr.aux_sample_config;
+		attr.sample_type = 0;
+		attr.disabled = event->attr.disabled;
+		attr.enable_on_exec = event->attr.enable_on_exec;
+		attr.exclude_hv = event->attr.exclude_hv;
+		attr.exclude_idle = event->attr.exclude_idle;
+		attr.exclude_user = event->attr.exclude_user;
+		attr.exclude_kernel = event->attr.exclude_kernel;
+		attr.aux_sample_size = event->attr.aux_sample_size;
+
+		sampler = perf_event_create_kernel_counter(&attr, event->cpu,
+							   task, NULL, NULL);
+		if (IS_ERR(sampler))
+			return PTR_ERR(sampler);
+
+		nr_pages = 1ul << __get_order(event->attr.aux_sample_size);
+
+		rb = rb_alloc_kernel(sampler, 0, nr_pages);
+		if (!rb) {
+			perf_event_release_kernel(sampler);
+			return -ENOMEM;
+		}
+
+		sampler->sampler_destroy = sampler->destroy;
+		sampler->destroy = perf_aux_sampler_destroy;
 	}
 
 	event->sampler = sampler;
-	sampler->sampler_destroy = sampler->destroy;
-	sampler->destroy = perf_aux_sampler_destroy;
 
 	return 0;
 }
@@ -4744,7 +4783,7 @@ static void perf_aux_sampler_fini(struct perf_event *event)
 	if (!sampler)
 		return;
 
-	perf_event_release_kernel(sampler);
+	put_event(sampler);
 
 	event->sampler = NULL;
 }

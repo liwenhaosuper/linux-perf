@@ -37,6 +37,8 @@
 #include "thread_map.h"
 #include "itrace.h"
 
+#include <linux/hash.h>
+
 #include "event.h"
 #include "session.h"
 #include "debug.h"
@@ -916,4 +918,125 @@ int itrace_mmap__read(struct itrace_mmap *mm, struct itrace_record *itr,
 	}
 
 	return 1;
+}
+
+/**
+ * struct itrace_cache - hash table to cache decoded instruction blocks
+ * @hashtable: the hashtable
+ * @sz: hashtable size (number of hlists)
+ * @entry_size: size of an entry
+ * @limit: limit the number of entries to this maximum, when reached the cache
+ *         is dropped and caching begins again with an empty cache
+ * @cnt: current number of entries
+ * @bits: hashtable size (@sz = 2^@bits)
+ */
+struct itrace_cache {
+	struct hlist_head *hashtable;
+	size_t sz;
+	size_t entry_size;
+	size_t limit;
+	size_t cnt;
+	unsigned int bits;
+};
+
+struct itrace_cache *itrace_cache__new(unsigned int bits, size_t entry_size,
+				       unsigned int limit_percent)
+{
+	struct itrace_cache *c;
+	struct hlist_head *ht;
+	size_t sz, i;
+
+	c = zalloc(sizeof(struct itrace_cache));
+	if (!c)
+		return NULL;
+
+	sz = 1UL << bits;
+
+	ht = calloc(sz, sizeof(struct hlist_head));
+	if (!ht)
+		goto out_free;
+
+	for (i = 0; i < sz; i++)
+		INIT_HLIST_HEAD(&ht[i]);
+
+	c->hashtable = ht;
+	c->sz = sz;
+	c->entry_size = entry_size;
+	c->limit = (c->sz * limit_percent) / 100;
+	c->bits = bits;
+
+	return c;
+
+out_free:
+	free(c);
+	return NULL;
+}
+
+static void itrace_cache__drop(struct itrace_cache *c)
+{
+	struct itrace_cache_entry *entry;
+	struct hlist_node *tmp;
+	size_t i;
+
+	if (!c)
+		return;
+
+	for (i = 0; i < c->sz; i++) {
+		hlist_for_each_entry_safe(entry, tmp, &c->hashtable[i], hash) {
+			hlist_del(&entry->hash);
+			itrace_cache__free_entry(c, entry);
+		}
+	}
+
+	c->cnt = 0;
+}
+
+void itrace_cache__free(struct itrace_cache *c)
+{
+	if (!c)
+		return;
+
+	itrace_cache__drop(c);
+	free(c->hashtable);
+	free(c);
+}
+
+void *itrace_cache__alloc_entry(struct itrace_cache *c)
+{
+	return malloc(c->entry_size);
+}
+
+void itrace_cache__free_entry(struct itrace_cache *c __maybe_unused,
+			      void *entry)
+{
+	free(entry);
+}
+
+int itrace_cache__add(struct itrace_cache *c, u32 key,
+		      struct itrace_cache_entry *entry)
+{
+	if (c->limit && ++c->cnt > c->limit)
+		itrace_cache__drop(c);
+
+	entry->key = key;
+	hlist_add_head(&entry->hash, &c->hashtable[hash_32(key, c->bits)]);
+
+	return 0;
+}
+
+void *itrace_cache__lookup(struct itrace_cache *c, u32 key)
+{
+	struct itrace_cache_entry *entry;
+	struct hlist_head *hlist;
+
+	if (!c)
+		return NULL;
+
+	hlist = &c->hashtable[hash_32(key, c->bits)];
+	hlist_for_each_entry(entry, hlist, hash) {
+		if (entry->key == key)
+			return entry;
+	}
+
+	return NULL;
 }

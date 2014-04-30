@@ -316,6 +316,20 @@ int itrace_heap__add(struct itrace_heap *heap, unsigned int queue_nr,
 void itrace_heap__pop(struct itrace_heap *heap);
 void itrace_heap__free(struct itrace_heap *heap);
 
+struct itrace_cache_entry {
+	struct hlist_node hash;
+	u32 key;
+};
+
+struct itrace_cache *itrace_cache__new(unsigned int bits, size_t entry_size,
+				       unsigned int limit_percent);
+void itrace_cache__free(struct itrace_cache *itrace_cache);
+void *itrace_cache__alloc_entry(struct itrace_cache *c);
+void itrace_cache__free_entry(struct itrace_cache *c, void *entry);
+int itrace_cache__add(struct itrace_cache *c, u32 key,
+		      struct itrace_cache_entry *entry);
+void *itrace_cache__lookup(struct itrace_cache *c, u32 key);
+
 struct itrace_record *itrace_record__init(struct perf_evlist *evlist, int *err);
 
 int itrace_record__options(struct itrace_record *itr,

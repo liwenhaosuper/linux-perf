@@ -101,6 +101,8 @@ struct dsos {
 	struct rb_root	 root;	/* rbtree root sorted by long name */
 };
 
+struct itrace_cache;
+
 struct dso {
 	struct list_head node;
 	struct rb_node	 rb_node;	/* rbtree node sorted by long name */
@@ -130,6 +132,7 @@ struct dso {
 	u16		 long_name_len;
 	u16		 short_name_len;
 	void		*dwfl;			/* DWARF debug info */
+	struct itrace_cache *itrace_cache;
 
 	/* dso data file */
 	struct {

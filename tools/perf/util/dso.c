@@ -4,6 +4,7 @@
 #include "symbol.h"
 #include "dso.h"
 #include "machine.h"
+#include "itrace.h"
 #include "util.h"
 #include "debug.h"
 
@@ -914,6 +915,7 @@ void dso__delete(struct dso *dso)
 	}
 
 	dso__data_close(dso);
+	itrace_cache__free(dso->itrace_cache);
 	dso_cache__free(&dso->data.cache);
 	dso__free_a2l(dso);
 	zfree(&dso->symsrc_filename);

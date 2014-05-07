@@ -263,6 +263,18 @@ struct pmu {
 	 * flush branch stack on context-switches (needed in cpu-wide mode)
 	 */
 	void (*flush_branch_stack)	(void);
+
+	/*
+	 * Set up pmu-private data structures for an AUX area
+	 */
+	void *(*setup_aux)		(int cpu, void **pages,
+					 int nr_pages, bool overwrite);
+					/* optional */
+
+	/*
+	 * Free pmu-private AUX data structures
+	 */
+	void (*free_aux)		(void *aux); /* optional */
 };
 
 /**
@@ -783,6 +795,11 @@ extern void perf_bp_event(struct perf_event *event, void *data);
 static inline bool has_branch_stack(struct perf_event *event)
 {
 	return event->attr.sample_type & PERF_SAMPLE_BRANCH_STACK;
+}
+
+static inline bool has_aux(struct perf_event *event)
+{
+	return event->pmu->setup_aux;
 }
 
 extern int perf_output_begin(struct perf_output_handle *handle,

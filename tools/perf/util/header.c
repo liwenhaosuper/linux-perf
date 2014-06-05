@@ -2177,6 +2177,7 @@ static const int attr_file_abi_sizes[] = {
 	[2] = PERF_ATTR_SIZE_VER2,
 	[3] = PERF_ATTR_SIZE_VER3,
 	[4] = PERF_ATTR_SIZE_VER4,
+	[5] = PERF_ATTR_SIZE_VER5,
 	0,
 };
 

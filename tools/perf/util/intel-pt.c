@@ -319,7 +319,7 @@ static int intel_pt_get_trace(struct intel_pt_buffer *b, void *data)
 	if (!old_buffer || ptq->pt->sampling_mode || (ptq->pt->snapshot_mode &&
 						      !buffer->consecutive)) {
 		b->consecutive = false;
-		b->trace_nr = buffer->buffer_nr;
+		b->trace_nr = buffer->buffer_nr + 1;
 	} else {
 		b->consecutive = true;
 	}
@@ -1090,6 +1090,8 @@ static int intel_pt_sample(struct intel_pt_queue *ptq, struct perf_tool *tool)
 		thread_stack__event(ptq->thread, ptq->flags, state->from_ip,
 				    state->to_ip, ptq->insn_len,
 				    state->trace_nr);
+	else
+		thread_stack__set_trace_nr(ptq->thread, state->trace_nr);
 
 	if (pt->sample_branches) {
 		err = intel_pt_synth_branch_sample(ptq, tool);

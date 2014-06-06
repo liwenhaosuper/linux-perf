@@ -24,6 +24,8 @@
 #include "session.h"
 #include "color.h"
 #include "util.h"
+#include "thread.h"
+#include "thread-stack.h"
 #include "pmu.h"
 #include "debug.h"
 #include "tsc.h"
@@ -483,19 +485,22 @@ static int intel_bts_process_buffer(struct intel_bts_queue *btsq,
 static int intel_bts_process_queue(struct intel_bts_queue *btsq, u64 *timestamp,
 				   struct perf_tool *tool)
 {
-	struct itrace_buffer *buffer = btsq->buffer;
+	struct itrace_buffer *buffer = btsq->buffer, *old_buffer = buffer;
 	struct itrace_queue *queue;
+	struct thread *thread;
 	int err;
 
 	if (btsq->done)
 		return 1;
 
 	if (btsq->pid == -1) {
-		struct thread *thread;
-
-		thread = machine__find_thread(btsq->bts->machine, -1, btsq->tid);
+		thread = machine__find_thread(btsq->bts->machine, -1,
+					      btsq->tid);
 		if (thread)
 			btsq->pid = thread->pid_;
+	} else {
+		thread = machine__findnew_thread(btsq->bts->machine, btsq->pid,
+						 btsq->tid);
 	}
 
 	queue = &btsq->bts->queues.queue_array[btsq->queue_nr];
@@ -524,6 +529,11 @@ static int intel_bts_process_queue(struct intel_bts_queue *btsq, u64 *timestamp,
 	if (btsq->bts->snapshot_mode && !buffer->consecutive &&
 	    intel_bts_do_fix_overlap(queue, buffer))
 		return -ENOMEM;
+
+	if (!btsq->bts->synth_opts.callchain && thread &&
+	    (!old_buffer || btsq->bts->sampling_mode ||
+	     (btsq->bts->snapshot_mode && !buffer->consecutive)))
+		thread_stack__set_trace_nr(thread, buffer->buffer_nr + 1);
 
 	err = intel_bts_process_buffer(btsq, buffer, tool);
 

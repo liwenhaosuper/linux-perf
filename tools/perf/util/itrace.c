@@ -1314,6 +1314,13 @@ static int __itrace_mmap__read(struct itrace_mmap *mm,
 		data2 = NULL;
 	}
 
+	if (itr->alignment) {
+		unsigned int unwanted = len1 % itr->alignment;
+
+		len1 -= unwanted;
+		size -= unwanted;
+	}
+
 	/* padding must be written by fn() e.g. record__process_itrace() */
 	padding = size & 7;
 	if (padding)

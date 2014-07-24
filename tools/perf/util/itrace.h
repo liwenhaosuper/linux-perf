@@ -314,6 +314,7 @@ struct itrace_record {
 				      const char *str);
 	u64 (*reference)(struct itrace_record *itr);
 	int (*read_finish)(struct itrace_record *itr, int idx);
+	unsigned int alignment;
 };
 
 /*

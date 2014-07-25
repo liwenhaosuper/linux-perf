@@ -302,6 +302,8 @@ void perf_tool__fill_defaults(struct perf_tool *tool)
 		tool->lost = perf_event__process_lost;
 	if (tool->aux == NULL)
 		tool->aux = perf_event__process_aux;
+	if (tool->itrace_start == NULL)
+		tool->itrace_start = perf_event__process_itrace_start;
 	if (tool->read == NULL)
 		tool->read = process_event_sample_stub;
 	if (tool->throttle == NULL)
@@ -428,6 +430,16 @@ static void perf_event__aux_swap(union perf_event *event, bool sample_id_all)
 
 	if (sample_id_all)
 		swap_sample_id_all(event, &event->aux + 1);
+}
+
+static void perf_event__itrace_start_swap(union perf_event *event,
+					  bool sample_id_all)
+{
+	event->itrace_start.pid	 = bswap_32(event->itrace_start.pid);
+	event->itrace_start.tid	 = bswap_32(event->itrace_start.tid);
+
+	if (sample_id_all)
+		swap_sample_id_all(event, &event->itrace_start + 1);
 }
 
 static void perf_event__throttle_swap(union perf_event *event,
@@ -571,6 +583,7 @@ static perf_event__swap_op perf_event__swap_ops[] = {
 	[PERF_RECORD_UNTHROTTLE]	  = perf_event__throttle_swap,
 	[PERF_RECORD_SAMPLE]		  = perf_event__all64_swap,
 	[PERF_RECORD_AUX]		  = perf_event__aux_swap,
+	[PERF_RECORD_ITRACE_START]	  = perf_event__itrace_start_swap,
 	[PERF_RECORD_HEADER_ATTR]	  = perf_event__hdr_attr_swap,
 	[PERF_RECORD_HEADER_EVENT_TYPE]	  = perf_event__event_type_swap,
 	[PERF_RECORD_HEADER_TRACING_DATA] = perf_event__tracing_data_swap,
@@ -1001,6 +1014,8 @@ static int __perf_session__deliver_event(struct perf_session *session,
 		return tool->unthrottle(tool, event, sample, machine);
 	case PERF_RECORD_AUX:
 		return tool->aux(tool, event, sample, machine);
+	case PERF_RECORD_ITRACE_START:
+		return tool->itrace_start(tool, event, sample, machine);
 	default:
 		++session->stats.nr_unknown_events;
 		return -1;

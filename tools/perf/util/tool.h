@@ -40,6 +40,7 @@ struct perf_tool {
 			exit,
 			lost,
 			aux,
+			itrace_start,
 			throttle,
 			unthrottle;
 	event_attr_op	attr;

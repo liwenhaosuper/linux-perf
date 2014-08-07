@@ -122,6 +122,17 @@ static inline unsigned long perf_aux_size(struct ring_buffer *rb)
 	return rb->aux_nr_pages << PAGE_SHIFT;
 }
 
+static inline bool kernel_rb_event(struct perf_event *event)
+{
+	/*
+	 * Having a ring buffer and not being on any ring buffers' wakeup
+	 * list means it was attached by rb_alloc_kernel() and not
+	 * ring_buffer_attach(). It's the only case when these two
+	 * conditions take place at the same time.
+	 */
+	return event->rb && list_empty(&event->rb_entry);
+}
+
 #define DEFINE_OUTPUT_COPY(func_name, memcpy_func)			\
 static inline unsigned long						\
 func_name(struct perf_output_handle *handle,				\

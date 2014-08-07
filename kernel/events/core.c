@@ -8320,6 +8320,15 @@ inherit_event(struct perf_event *parent_event,
 		= parent_event->overflow_handler_context;
 
 	/*
+	 * For per-task kernel events with ring buffers, set_output doesn't
+	 * make sense, but we can allocate a new buffer here.
+	 */
+	if (parent_event->cpu == -1 && kernel_rb_event(parent_event)) {
+		(void)rb_alloc_kernel(child_event, parent_event->rb->nr_pages,
+				      parent_event->rb->aux_nr_pages);
+	}
+
+	/*
 	 * Precalculate sample_data sizes
 	 */
 	perf_event__header_size(child_event);

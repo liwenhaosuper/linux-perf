@@ -4699,47 +4699,67 @@ static bool perf_aux_event_match(struct perf_event *e1, struct perf_event *e2)
 	return has_aux(e1) && exclusive_event_match(e1, e2);
 }
 
+struct perf_event *__find_sampling_counter(struct perf_event_context *ctx,
+					   struct perf_event *event,
+					   struct task_struct *task)
+{
+	struct perf_event *sampler = NULL;
+
+	list_for_each_entry(sampler, &ctx->event_list, event_entry) {
+		/*
+		 * event is not an itrace event, but all the relevant
+		 * bits should match
+		 */
+		if (perf_aux_event_match(sampler, event) &&
+		    kernel_rb_event(sampler) &&
+		    sampler->attr.type == event->attr.aux_sample_type &&
+		    sampler->attr.config == event->attr.aux_sample_config &&
+		    sampler->attr.exclude_hv == event->attr.exclude_hv &&
+		    sampler->attr.exclude_idle == event->attr.exclude_idle &&
+		    sampler->attr.exclude_user == event->attr.exclude_user &&
+		    sampler->attr.exclude_kernel == event->attr.exclude_kernel &&
+		    sampler->attr.aux_sample_size >= event->attr.aux_sample_size &&
+		    atomic_long_inc_not_zero(&sampler->refcount))
+			return sampler;
+	}
+
+	return NULL;
+}
+
+struct perf_event *find_sampling_counter(struct pmu *pmu,
+					 struct perf_event *event,
+					 struct task_struct *task)
+{
+	struct perf_event_context *ctx;
+	struct perf_event *sampler = NULL;
+	unsigned long flags;
+
+	ctx = find_get_context(pmu, task, event->cpu);
+	if (!ctx)
+		return NULL;
+
+	raw_spin_lock_irqsave(&ctx->lock, flags);
+	sampler = __find_sampling_counter(ctx, event, task);
+	--ctx->pin_count;
+	put_ctx(ctx);
+	raw_spin_unlock_irqrestore(&ctx->lock, flags);
+
+	return sampler;
+}
+
 static int perf_aux_sampler_init(struct perf_event *event,
 				 struct task_struct *task,
 				 struct pmu *pmu)
 {
-	struct perf_event_context *ctx;
 	struct perf_event_attr attr;
-	struct perf_event *sampler = NULL;
+	struct perf_event *sampler;
 	struct ring_buffer *rb;
-	unsigned long nr_pages, flags;
+	unsigned long nr_pages;
 
 	if (!pmu || !(pmu->setup_aux))
 		return -ENOTSUPP;
 
-	ctx = find_get_context(pmu, task, event->cpu);
-	if (ctx) {
-		raw_spin_lock_irqsave(&ctx->lock, flags);
-		list_for_each_entry(sampler, &ctx->event_list, event_entry) {
-			/*
-			 * event is not an aux event, but all the relevant
-			 * bits should match
-			 */
-			if (perf_aux_event_match(sampler, event) &&
-			    sampler->attr.type == event->attr.aux_sample_type &&
-			    sampler->attr.config == event->attr.aux_sample_config &&
-			    sampler->attr.exclude_hv == event->attr.exclude_hv &&
-			    sampler->attr.exclude_idle == event->attr.exclude_idle &&
-			    sampler->attr.exclude_user == event->attr.exclude_user &&
-			    sampler->attr.exclude_kernel == event->attr.exclude_kernel &&
-			    sampler->attr.aux_sample_size >= event->attr.aux_sample_size &&
-			    atomic_long_inc_not_zero(&sampler->refcount))
-				goto got_event;
-		}
-
-		sampler = NULL;
-
-got_event:
-		--ctx->pin_count;
-		put_ctx(ctx);
-		raw_spin_unlock_irqrestore(&ctx->lock, flags);
-	}
-
+	sampler = find_sampling_counter(pmu, event, task);
 	if (!sampler) {
 		memset(&attr, 0, sizeof(attr));
 		attr.type = pmu->type;
@@ -4791,9 +4811,19 @@ static void perf_aux_sampler_fini(struct perf_event *event)
 static unsigned long perf_aux_sampler_trace(struct perf_event *event,
 					    struct perf_sample_data *data)
 {
-	struct perf_event *sampler = event->sampler;
+	struct perf_event *sampler;
 	struct ring_buffer *rb;
 
+	if (!event->sampler) {
+		/*
+		 * down this path, event->ctx is already locked IF it's the
+		 * same context
+		 */
+		event->sampler = __find_sampling_counter(event->ctx, event,
+							 event->ctx->task);
+	}
+
+	sampler = event->sampler;
 	if (!sampler || sampler->state != PERF_EVENT_STATE_ACTIVE) {
 		data->aux.size = 0;
 		goto out;

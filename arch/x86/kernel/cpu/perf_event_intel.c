@@ -1029,20 +1029,6 @@ static __initconst const u64 slm_hw_cache_event_ids
  },
 };
 
-static inline bool intel_pmu_needs_lbr_smpl(struct perf_event *event)
-{
-	/* user explicitly requested branch sampling */
-	if (has_branch_stack(event))
-		return true;
-
-	/* implicit branch sampling to correct PEBS skid */
-	if (x86_pmu.intel_cap.pebs_trap && event->attr.precise_ip > 1 &&
-	    x86_pmu.intel_cap.pebs_format < 2)
-		return true;
-
-	return false;
-}
-
 static void intel_pmu_disable_all(void)
 {
 	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
@@ -1751,6 +1737,18 @@ static int intel_pmu_hw_config(struct perf_event *event)
 		ret = intel_pmu_setup_lbr_filter(event);
 		if (ret)
 			return ret;
+
+		/*
+		 * bts is set up earlier in this path, so don't account
+		 * twice
+		 */
+		if (!intel_pmu_has_bts(event)) {
+			/* disallow lbr if conflicting events are present */
+			if (x86_add_exclusive(x86_lbr_exclusive_lbr))
+				return -EBUSY;
+
+			event->destroy = hw_perf_lbr_event_destroy;
+		}
 	}
 
 	if (event->attr.type != PERF_TYPE_RAW)

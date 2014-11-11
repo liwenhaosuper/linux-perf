@@ -294,16 +294,36 @@ struct itrace_record {
 	int (*read_finish)(struct itrace_record *itr, int idx);
 };
 
-static inline u64 itrace_mmap__read_head(struct itrace_mmap *mm __maybe_unused)
+static inline u64 itrace_mmap__read_head(struct itrace_mmap *mm)
 {
-	/* Not yet implemented */
-	return 0;
+	struct perf_event_mmap_page *pc = mm->userpg;
+#if BITS_PER_LONG == 64 || !defined(HAVE_SYNC_COMPARE_AND_SWAP_SUPPORT)
+	u64 head = ACCESS_ONCE(pc->aux_head);
+#else
+	u64 head = __sync_val_compare_and_swap(&pc->aux_head, 0, 0);
+#endif
+
+	/* Ensure all reads are done after we read the head */
+	rmb();
+	return head;
 }
 
-static inline void itrace_mmap__write_tail(struct itrace_mmap *mm __maybe_unused,
-					   u64 tail __maybe_unused)
+static inline void itrace_mmap__write_tail(struct itrace_mmap *mm, u64 tail)
 {
-	/* Not yet implemented */
+	struct perf_event_mmap_page *pc = mm->userpg;
+#if BITS_PER_LONG != 64 && defined(HAVE_SYNC_COMPARE_AND_SWAP_SUPPORT)
+	u64 old_tail;
+#endif
+
+	/* Ensure all reads are done before we write the tail out */
+	mb();
+#if BITS_PER_LONG == 64 || !defined(HAVE_SYNC_COMPARE_AND_SWAP_SUPPORT)
+	pc->aux_tail = tail;
+#else
+	do {
+		old_tail = __sync_val_compare_and_swap(&pc->aux_tail, 0, 0);
+	} while (!__sync_bool_compare_and_swap(&pc->aux_tail, old_tail, tail));
+#endif
 }
 
 int itrace_mmap__mmap(struct itrace_mmap *mm,

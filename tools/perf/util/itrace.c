@@ -47,6 +47,8 @@
 int itrace_mmap__mmap(struct itrace_mmap *mm, struct itrace_mmap_params *mp,
 		      void *userpg, int fd)
 {
+	struct perf_event_mmap_page *pc = userpg;
+
 #if BITS_PER_LONG != 64 && !defined(HAVE_SYNC_COMPARE_AND_SWAP_SUPPORT)
 	pr_err("Cannot use Instruction Tracing mmaps\n");
 	return -1;
@@ -64,6 +66,9 @@ int itrace_mmap__mmap(struct itrace_mmap *mm, struct itrace_mmap_params *mp,
 		mm->base = NULL;
 		return 0;
 	}
+
+	pc->aux_offset = mp->offset;
+	pc->aux_size = mp->len;
 
 	mm->base = mmap(NULL, mp->len, mp->prot, MAP_SHARED, fd, mp->offset);
 	if (mm->base == MAP_FAILED) {
